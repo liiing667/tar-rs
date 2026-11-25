@@ -13,6 +13,8 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::path_validation::{gnu_ustar_path_conflict, GnuUstarPathConflict};
+use crate::security_record::{record_gnu_ustar_path_conflict, PathConflictRecord};
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -67,6 +69,9 @@ impl<'a, R: Read> Entry<'a, R> {
     /// This method may fail if the pathname is not valid Unicode and this is
     /// called on a Windows platform.
     ///
+    /// It also fails closed when a GNU long name and a populated USTAR prefix
+    /// describe inconsistent path hierarchies.
+    ///
     /// Note that this function will convert any `\` characters to directory
     /// separators, and it will not always return the same value as
     /// `self.header().path()` as some archive formats have support for longer
@@ -79,6 +84,10 @@ impl<'a, R: Read> Entry<'a, R> {
     }
 
     /// Returns the raw bytes listed for this entry.
+    ///
+    /// Because this accessor is infallible, an inconsistent GNU/USTAR path
+    /// interpretation is represented by an empty byte slice. Use
+    /// [`Entry::path`] when the format conflict must be reported as an error.
     ///
     /// Note that this function will convert any `\` characters to directory
     /// separators, and it will not always return the same value as
@@ -302,10 +311,50 @@ impl<'a> EntryFields<'a> {
     }
 
     fn path(&self) -> io::Result<Cow<'_, Path>> {
-        bytes2path(self.path_bytes())
+        self.validated_path_bytes()
+            .map_err(GnuUstarPathConflict::into_io_error)
+            .and_then(bytes2path)
+    }
+
+    /// Detect a GNU-longname/USTAR-prefix conflict for this entry.
+    fn gnu_ustar_path_conflict(&self) -> Option<GnuUstarPathConflict> {
+        let ustar = self.header.as_ustar()?;
+        let ustar_prefix_present = ustar.prefix[0] != 0;
+        let ustar_name_len = ustar
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(ustar.name.len());
+        // Writers either fill all 100 bytes or use 99 bytes plus a terminator.
+        let ustar_name_field_saturated = ustar_name_len >= ustar.name.len() - 1;
+        gnu_ustar_path_conflict(
+            self.long_pathname.as_deref(),
+            self.header.path_bytes(),
+            ustar_prefix_present,
+            ustar_name_field_saturated,
+        )
+    }
+
+    /// Return the path bytes only when format interpretations can be safely
+    /// reconciled.
+    fn validated_path_bytes(&self) -> Result<Cow<'_, [u8]>, GnuUstarPathConflict> {
+        if let Some(conflict) = self.gnu_ustar_path_conflict() {
+            return Err(conflict);
+        }
+        Ok(self.unchecked_path_bytes())
     }
 
     fn path_bytes(&self) -> Cow<'_, [u8]> {
+        // The infallible public byte accessor cannot return an error. On a
+        // format conflict it therefore fails closed with an empty identity
+        // rather than silently selecting either attacker-controlled spelling.
+        // Security-sensitive callers that can handle `Result` should use
+        // `Entry::path` / `Entry::unpack_in`, which report the conflict.
+        self.validated_path_bytes()
+            .unwrap_or_else(|_| Cow::Borrowed(&[][..]))
+    }
+
+    fn unchecked_path_bytes(&self) -> Cow<'_, [u8]> {
         match self.long_pathname {
             Some(ref bytes) => {
                 if let Some(&0) = bytes.last() {
@@ -331,7 +380,7 @@ impl<'a> EntryFields<'a> {
 
     /// Gets the path in a "lossy" way, used for error reporting ONLY.
     fn path_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.path_bytes()).to_string()
+        String::from_utf8_lossy(&self.unchecked_path_bytes()).to_string()
     }
 
     fn link_name(&self) -> io::Result<Option<Cow<'_, Path>>> {
@@ -395,7 +444,33 @@ impl<'a> EntryFields<'a> {
 
         let mut file_dst = dst.to_path_buf();
         {
-            let path = self.path().map_err(|e| {
+            let validated_path = match self.validated_path_bytes() {
+                Ok(path) => path,
+                Err(conflict) => {
+                    let detail = conflict.clone().into_io_error().to_string();
+                    // Persist the reviewable security record before closing the
+                    // failing transaction. No archive-derived path component
+                    // has been pushed or created at this point.
+                    record_gnu_ustar_path_conflict(
+                        dst,
+                        &PathConflictRecord {
+                            header_offset: self.header_pos,
+                            conflict: &conflict,
+                        },
+                    )
+                    .map_err(|e| TarError::new("failed to write extraction security record", e))?;
+
+                    let error = TarError::new(
+                        format!(
+                            "invalid path in entry header `{}`: {detail}",
+                            self.path_lossy()
+                        ),
+                        conflict.into_io_error(),
+                    );
+                    return Err(error.into());
+                }
+            };
+            let path = bytes2path(validated_path).map_err(|e| {
                 TarError::new(
                     format!("invalid path in entry header: {}", self.path_lossy()),
                     e,

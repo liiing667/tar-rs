@@ -14,6 +14,12 @@
 //! directory: paths containing `..` are rejected, and symlink targets within
 //! the archive are validated before use.
 //!
+//! If a GNU long name and a populated USTAR prefix/name pair disagree about
+//! the hierarchy of an entry, [`Entry::path`] fails and extraction refuses to
+//! publish that entry. [`Entry::unpack_in`] additionally appends a reviewable
+//! event to `.tar-security-record` in the extraction root before returning the
+//! error, leaving an auditable record of the failed transaction.
+//!
 //! **Concurrent mutation of the destination tree is outside the threat model.**
 //! If another process modifies the destination (for example, by atomically
 //! swapping a symlink) while extraction is in progress, this crate may follow
@@ -57,7 +63,9 @@ mod entry;
 mod entry_type;
 mod error;
 mod header;
+mod path_validation;
 mod pax;
+mod security_record;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)

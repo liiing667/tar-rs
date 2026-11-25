@@ -415,6 +415,13 @@ impl Header {
         allow_absolute: bool,
     ) -> io::Result<()> {
         if let Some(ustar) = self.as_ustar_mut() {
+            if is_truncated_gnu_long_path {
+                // A GNU `L` record supplies the authoritative full name. Do
+                // not leave a stale USTAR prefix from a previous `set_path`
+                // call: combining it with the truncated fallback name would
+                // create a second, inconsistent hierarchy interpretation.
+                ustar.prefix = [0; 155];
+            }
             return if allow_absolute {
                 ustar.set_path_absolute(path)
             } else {
