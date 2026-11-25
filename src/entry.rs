@@ -6,6 +6,7 @@ use std::io::prelude::*;
 use std::io::{self, Error, ErrorKind, SeekFrom};
 use std::marker;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use filetime::{self, FileTime};
 
@@ -201,7 +202,7 @@ impl<'a, R: Read> Entry<'a, R> {
     /// }
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
-        self.fields.unpack(None, dst.as_ref())
+        self.fields.unpack(None, dst.as_ref(), false)
     }
 
     /// Extracts this file under the specified path, avoiding security issues.
@@ -210,7 +211,15 @@ impl<'a, R: Read> Entry<'a, R> {
     /// location obtained by appending the path of this file in the archive to
     /// `dst`, creating any intermediate directories if needed. Metadata will
     /// also be propagated to the path `dst`. Any existing file at the location
-    /// `dst` will be overwritten.
+    /// `dst` is replaced according to [`Archive::set_overwrite`].
+    ///
+    /// Regular files are streamed to a unique temporary file in the destination
+    /// directory and are published at their final path only after every
+    /// declared data block and the expanded logical size have been verified.
+    /// A body whose length does not match its header therefore returns an
+    /// error without creating or replacing the final member; its temporary
+    /// file is removed. Such rejected publications are recorded in
+    /// `.tar-security-record` at the canonical extraction root.
     ///
     /// # Security
     ///
@@ -436,7 +445,7 @@ impl<'a> EntryFields<'a> {
 
         let canon_target = self.validate_inside_dst(dst, parent)?;
 
-        self.unpack(Some(&canon_target), &file_dst)
+        self.unpack(Some(&canon_target), &file_dst, true)
             .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
 
         Ok(true)
@@ -460,7 +469,12 @@ impl<'a> EntryFields<'a> {
     }
 
     /// Returns access to the header of this entry in the archive.
-    fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
+    fn unpack(
+        &mut self,
+        target_base: Option<&Path>,
+        dst: &Path,
+        atomic_publish: bool,
+    ) -> io::Result<Unpacked> {
         fn set_perms_ownerships(
             dst: &Path,
             f: Option<&mut std::fs::File>,
@@ -649,25 +663,71 @@ impl<'a> EntryFields<'a> {
         fn open(dst: &Path) -> io::Result<std::fs::File> {
             OpenOptions::new().write(true).create_new(true).open(dst)
         }
-        let mut f = (|| -> io::Result<std::fs::File> {
-            let mut f = open(dst).or_else(|err| {
-                if err.kind() != ErrorKind::AlreadyExists {
-                    Err(err)
-                } else if self.overwrite {
-                    match fs::remove_file(dst) {
-                        Ok(()) => open(dst),
-                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst),
-                        Err(e) => Err(e),
+
+        let header_name = String::from_utf8_lossy(&self.header.path_bytes()).into_owned();
+        let destination_name = dst.display().to_string();
+        let wrap_error = move |e: io::Error| -> TarError {
+            TarError::new(
+                format!("failed to unpack `{header_name}` into `{destination_name}`"),
+                e,
+            )
+        };
+
+        // For security-checked unpacking, stream into a unique sibling
+        // staging file. The final destination is not created or replaced
+        // until every declared block has been copied and verified.
+        let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+        let staging_allocation = if atomic_publish {
+            Some(create_staging_file(parent, dst))
+        } else {
+            None
+        };
+        let (staging_path, staged_file) = match staging_allocation {
+            None => (None, None),
+            Some(Ok((path, file))) => (Some(path), Some(file)),
+            Some(Err(error)) => {
+                record_atomic_rejection(target_base, self, None, &error);
+                return Err(wrap_error(error).into());
+            }
+        };
+        let _staging_cleanup = staging_path
+            .as_ref()
+            .map(|path| StagingCleanup(path.clone()));
+        let write_path = staging_path.as_deref().unwrap_or(dst);
+        let mut staged_bytes: Option<u64> = None;
+
+        let write_result = (|| -> io::Result<std::fs::File> {
+            let mut f = match staged_file {
+                Some(f) => f,
+                None => open(dst).or_else(|err| {
+                    if err.kind() != ErrorKind::AlreadyExists {
+                        Err(err)
+                    } else if self.overwrite {
+                        match fs::remove_file(dst) {
+                            Ok(()) => open(dst),
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Err(err)
                     }
-                } else {
-                    Err(err)
-                }
-            })?;
+                })?,
+            };
             for io in self.data.drain(..) {
                 match io {
                     EntryIo::Data(mut d) => {
                         let expected = d.limit();
-                        if io::copy(&mut d, &mut f)? != expected {
+                        let copied = match io::copy(&mut d, &mut f) {
+                            Ok(copied) => copied,
+                            Err(error) => {
+                                staged_bytes = f.metadata().ok().map(|m| m.len());
+                                return Err(error);
+                            }
+                        };
+                        if copied != expected {
+                            // Keep the historical error message and kind; the
+                            // atomic rollback is handled by the staging guard.
+                            staged_bytes = f.metadata().ok().map(|m| m.len());
                             return Err(other("failed to write entire file"));
                         }
                     }
@@ -679,40 +739,71 @@ impl<'a> EntryFields<'a> {
                     }
                 }
             }
-            Ok(f)
-        })()
-        .map_err(|e| {
-            let header = self.header.path_bytes();
-            TarError::new(
-                format!(
-                    "failed to unpack `{}` into `{}`",
-                    String::from_utf8_lossy(&header),
-                    dst.display()
-                ),
-                e,
-            )
-        })?;
 
-        if self.preserve_mtime {
-            if let Some(mtime) = get_mtime(&self.header) {
-                // filetime deprecates its API on Rust 1.99+ in favour of std, whose
-                // replacements need a newer Rust than our MSRV; see #458.
-                #[allow(deprecated)]
-                filetime::set_file_handle_times(&f, Some(mtime), Some(mtime)).map_err(|e| {
-                    TarError::new(format!("failed to set mtime for `{}`", dst.display()), e)
-                })?;
+            if atomic_publish {
+                // The per-fragment limit checks archive data blocks; this
+                // inode-size check also covers sparse holes and confirms that
+                // the complete logical member was materialized before publish.
+                let actual_size = match f.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) => {
+                        staged_bytes = None;
+                        return Err(error);
+                    }
+                };
+                if actual_size != self.size {
+                    staged_bytes = Some(actual_size);
+                    return Err(other("failed to write entire file"));
+                }
+                staged_bytes = Some(actual_size);
             }
+            Ok(f)
+        })();
+        let mut f = match write_result {
+            Ok(f) => f,
+            Err(error) => {
+                record_atomic_rejection(target_base, self, staged_bytes, &error);
+                return Err(wrap_error(error).into());
+            }
+        };
+
+        let metadata_result: io::Result<()> = (|| {
+            if self.preserve_mtime {
+                if let Some(mtime) = get_mtime(&self.header) {
+                    // filetime deprecates its API on Rust 1.99+ in favour of std, whose
+                    // replacements need a newer Rust than our MSRV; see #458.
+                    #[allow(deprecated)]
+                    filetime::set_file_handle_times(&f, Some(mtime), Some(mtime)).map_err(|e| {
+                        TarError::new(format!("failed to set mtime for `{}`", dst.display()), e)
+                    })?;
+                }
+            }
+            set_perms_ownerships(
+                dst,
+                Some(&mut f),
+                &self.header,
+                self.mask,
+                self.preserve_permissions,
+                self.preserve_ownerships,
+            )?;
+            if self.unpack_xattrs {
+                set_xattrs(self, write_path)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = metadata_result {
+            record_atomic_rejection(target_base, self, staged_bytes.or(Some(self.size)), &error);
+            return Err(error);
         }
-        set_perms_ownerships(
-            dst,
-            Some(&mut f),
-            &self.header,
-            self.mask,
-            self.preserve_permissions,
-            self.preserve_ownerships,
-        )?;
-        if self.unpack_xattrs {
-            set_xattrs(self, dst)?;
+
+        if atomic_publish {
+            let staging_path = staging_path
+                .as_deref()
+                .expect("atomic publication has a staging path");
+            if let Err(error) = publish_staged_file(staging_path, dst, self.overwrite) {
+                record_atomic_rejection(target_base, self, Some(self.size), &error);
+                return Err(wrap_error(error).into());
+            }
         }
         return Ok(Unpacked::File(f));
 
@@ -953,6 +1044,123 @@ impl<'a> EntryFields<'a> {
             return Err(err.into());
         }
         Ok(canon_target)
+    }
+}
+
+/// Process-wide counter used to allocate unique staging file names.
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Removes a staging file when an unpack attempt leaves this scope.
+///
+/// After a successful rename the path no longer exists. After a successful
+/// no-overwrite hard-link publication, dropping this guard removes the extra
+/// staging name while the published hard link keeps the inode alive.
+struct StagingCleanup(PathBuf);
+
+impl Drop for StagingCleanup {
+    fn drop(&mut self) {
+        // Cleanup is best-effort: the extraction result has already been
+        // determined and a failed unlink must not replace that outcome.
+        #[cfg(windows)]
+        {
+            // Windows refuses to delete a read-only staging file. Clear only
+            // the read-only attribute before the best-effort unlink.
+            if let Ok(metadata) = fs::symlink_metadata(&self.0) {
+                let mut permissions = metadata.permissions();
+                if permissions.readonly() {
+                    permissions.set_readonly(false);
+                    let _ = fs::set_permissions(&self.0, permissions);
+                }
+            }
+        }
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Best-effort append an audit event for a failed atomic publication.
+///
+/// Audit persistence must never replace or alter the original extraction
+/// error. Direct, rootless [`Entry::unpack`] calls have no extraction-root
+/// audit location (`root == None`) and are therefore not recorded here.
+fn record_atomic_rejection(
+    root: Option<&Path>,
+    fields: &EntryFields<'_>,
+    staged_bytes: Option<u64>,
+    error: &io::Error,
+) {
+    let root = match root {
+        Some(root) => root,
+        None => return,
+    };
+    let entry_path = fields.path_lossy();
+    let _ = crate::security_record::record_rejected_publication(
+        root,
+        &crate::security_record::RejectedPublication {
+            header_offset: fields.header_pos,
+            entry_path: &entry_path,
+            declared_size: fields.size,
+            staged_bytes,
+            error,
+        },
+    );
+}
+
+/// Create a unique `O_CREAT | O_EXCL` staging file in `parent`.
+///
+/// The name is not derived from the archive member name so very long final
+/// path components do not become longer than the filesystem's name limit.
+/// Exclusive creation means an archive-planted symlink or file can never cause
+/// this helper to truncate an existing path.
+fn create_staging_file(parent: &Path, destination: &Path) -> io::Result<(PathBuf, fs::File)> {
+    const ALLOCATION_ATTEMPTS: u32 = 4096;
+
+    let pid = std::process::id();
+    for _ in 0..ALLOCATION_ATTEMPTS {
+        let sequence = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".tar-rs-staging-{pid}-{sequence}"));
+
+        // An archive member could have exactly the same name as the first
+        // generated staging path. Never stage a file at its own destination.
+        if path == destination {
+            continue;
+        }
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Keep partially streamed member data private until the requested
+            // header mode is applied immediately before publication.
+            options.mode(0o600);
+        }
+
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        "failed to allocate a unique tar extraction staging file",
+    ))
+}
+
+/// Atomically publish a fully verified staging file.
+///
+/// Overwriting extraction uses `rename`, which atomically replaces the final
+/// path on Unix and maps to replace-existing move semantics on Windows.
+/// Non-overwriting extraction uses a hard link: link creation fails with
+/// [`ErrorKind::AlreadyExists`] if the destination appeared first, preserving
+/// the historical `create_new` error kind without creating a partial final
+/// file. The caller's cleanup guard then unlinks the staging name.
+fn publish_staged_file(staging: &Path, destination: &Path, overwrite: bool) -> io::Result<()> {
+    if overwrite {
+        fs::rename(staging, destination)
+    } else {
+        fs::hard_link(staging, destination)
     }
 }
 

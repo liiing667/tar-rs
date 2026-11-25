@@ -23,6 +23,14 @@
 //! where the destination may be concurrently modified, use the [`cap-std`]
 //! crate and/or OS-level sandboxing.
 //!
+//! Regular files extracted with [`Entry::unpack_in`] (and therefore
+//! [`Archive::unpack`]) are fully streamed and verified in a temporary sibling
+//! before being atomically published at their final destination. A body length
+//! mismatch rolls back the temporary file and leaves any previous destination
+//! file intact. Rejected publications append an audit event to
+//! `.tar-security-record` in the extraction root. Direct calls to
+//! [`Entry::unpack`] retain their historical rootless, direct-write behavior.
+//!
 //! [`cap-std`]: https://docs.rs/cap-std/
 
 // More docs about the detailed tar format can also be found here:
@@ -58,6 +66,7 @@ mod entry_type;
 mod error;
 mod header;
 mod pax;
+mod security_record;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)
