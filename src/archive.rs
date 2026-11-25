@@ -288,14 +288,32 @@ impl<'a> EntriesFields<'a> {
     ) -> io::Result<Option<Entry<'a, io::Empty>>> {
         let mut header = Header::new_old();
         let mut header_pos = self.next;
+        let mut truncated_header = false;
         loop {
             // Seek to the start of the next header in the archive
             let delta = self.next - self.archive.inner.pos.get();
             self.skip(delta)?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !try_read_all(&mut &self.archive.inner, header.as_mut_bytes())? {
-                return Ok(None);
+            match read_header_block(&mut &self.archive.inner, header.as_mut_bytes())? {
+                HeaderRead::Eof => return Ok(None),
+                HeaderRead::Partial(read) => {
+                    // A very short trailing block does not identify a member.
+                    // Preserve the historical hard error in that case. If the
+                    // name and size prefix are present, expose a fail-closed
+                    // candidate through `unpack_in` so callers can persist an
+                    // admission/evidence record before the generation is
+                    // discarded.
+                    if read < MIN_IDENTIFIABLE_HEADER_BYTES
+                        || header.as_bytes().iter().all(|byte| *byte == 0)
+                    {
+                        return Err(other("failed to read entire block"));
+                    }
+                    truncated_header = true;
+                    self.next += BLOCK_SIZE;
+                    break;
+                }
+                HeaderRead::Complete => {}
             }
 
             // If a header is not all zeros, we have another valid header.
@@ -313,15 +331,19 @@ impl<'a> EntriesFields<'a> {
             header_pos = self.next;
         }
 
-        // Make sure the checksum is ok
-        let sum = header.as_bytes()[..148]
-            .iter()
-            .chain(&header.as_bytes()[156..])
-            .fold(0, |a, b| a + (*b as u32))
-            + 8 * 32;
-        let cksum = header.cksum()?;
-        if sum != cksum {
-            return Err(other("archive header checksum mismatch"));
+        // A truncated prefix cannot have a trustworthy checksum. Such entries
+        // are marked incomplete and rejected by `unpack_in` before writes.
+        if !truncated_header {
+            // Make sure the checksum is ok
+            let sum = header.as_bytes()[..148]
+                .iter()
+                .chain(&header.as_bytes()[156..])
+                .fold(0, |a, b| a + (*b as u32))
+                + 8 * 32;
+            let cksum = header.cksum()?;
+            if sum != cksum {
+                return Err(other("archive header checksum mismatch"));
+            }
         }
 
         // PAX extensions describe the *next file entry*, not intermediary
@@ -368,6 +390,7 @@ impl<'a> EntriesFields<'a> {
             preserve_mtime: self.archive.inner.preserve_mtime,
             overwrite: self.archive.inner.overwrite,
             preserve_ownerships: self.archive.inner.preserve_ownerships,
+            header_truncated: truncated_header,
         };
 
         // Store where the next entry is, rounding up by 512 bytes (the size of
@@ -630,4 +653,34 @@ fn try_read_all<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Minimum prefix containing the member name and octal size fields.
+const MIN_IDENTIFIABLE_HEADER_BYTES: usize = 136;
+
+enum HeaderRead {
+    Eof,
+    Complete,
+    Partial(usize),
+}
+
+/// Read a fixed-size header block while retaining a short trailing prefix.
+///
+/// [`try_read_all`] turns a short read into an error and discards the bytes
+/// already read. Generation recovery needs those identifying fields so the
+/// fail-closed entry can record the object identity in its extraction root.
+fn read_header_block<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<HeaderRead> {
+    let mut read = 0;
+    while read < buf.len() {
+        match r.read(&mut buf[read..])? {
+            0 => {
+                if read == 0 {
+                    return Ok(HeaderRead::Eof);
+                }
+                return Ok(HeaderRead::Partial(read));
+            }
+            n => read += n,
+        }
+    }
+    Ok(HeaderRead::Complete)
 }

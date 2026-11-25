@@ -13,6 +13,7 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::security_record::{self, UnpackEvidence};
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -42,6 +43,7 @@ pub struct EntryFields<'a> {
     pub preserve_ownerships: bool,
     pub preserve_mtime: bool,
     pub overwrite: bool,
+    pub header_truncated: bool,
 }
 
 pub enum EntryIo<'a> {
@@ -380,6 +382,23 @@ impl<'a> EntryFields<'a> {
     }
 
     fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
+        let reopened = security_record::root_contains_prior_generation(dst);
+        let result = self.unpack_in_inner(dst);
+        security_record::record_unpack_outcome(
+            dst,
+            UnpackEvidence {
+                entry_path: &self.path_lossy(),
+                header_pos: self.header_pos,
+                declared_size: self.size,
+                candidate_incomplete: self.header_truncated,
+            },
+            reopened,
+            &result,
+        );
+        result
+    }
+
+    fn unpack_in_inner(&mut self, dst: &Path) -> io::Result<bool> {
         // Notes regarding bsdtar 2.8.3 / libarchive 2.8.3:
         // * Leading '/'s are trimmed. For example, `///test` is treated as
         //   `test`.
@@ -392,6 +411,13 @@ impl<'a> EntryFields<'a> {
         //
         // Most of this is handled by the `path` module of the standard
         // library, but we specially handle a few cases here as well.
+
+        if self.header_truncated {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "truncated tar header; refusing to publish an incomplete generation",
+            ));
+        }
 
         let mut file_dst = dst.to_path_buf();
         {
@@ -461,6 +487,16 @@ impl<'a> EntryFields<'a> {
 
     /// Returns access to the header of this entry in the archive.
     fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
+        // Keep the non-root public entry API on the same fail-closed boundary
+        // as `unpack_in`: a truncated header must never create a destination
+        // file or publish an empty candidate generation.
+        if self.header_truncated {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "truncated tar header; refusing to publish an incomplete generation",
+            ));
+        }
+
         fn set_perms_ownerships(
             dst: &Path,
             f: Option<&mut std::fs::File>,
