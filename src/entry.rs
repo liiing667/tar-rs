@@ -13,7 +13,7 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
-use crate::{Archive, Header, PaxExtensions};
+use crate::{Archive, EntryType, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
 ///
@@ -215,6 +215,11 @@ impl<'a, R: Read> Entry<'a, R> {
     /// # Security
     ///
     /// See the [crate-level security documentation][crate#security].
+    /// After the entry has been written, this function re-verifies the
+    /// identity of the extraction root and of the written object; if a
+    /// concurrent process redirected a previously committed symlink (or the
+    /// root itself) during the write, an error is returned and a record is
+    /// appended to `.tar-unpack-security-record` in the extraction root.
     ///
     /// # Examples
     ///
@@ -436,8 +441,45 @@ impl<'a> EntryFields<'a> {
 
         let canon_target = self.validate_inside_dst(dst, parent)?;
 
-        self.unpack(Some(&canon_target), &file_dst)
+        // Capture the identity of the extraction root before unpacking so
+        // that at the final commit boundary (after the entry has been
+        // written) we can re-verify that neither the root nor the object we
+        // just wrote was redirected by a concurrent process. See the
+        // crate-level security documentation for the threat model.
+        let root_guard = UnpackRootGuard::new(&canon_target).map_err(|e| {
+            TarError::new(
+                format!(
+                    "failed to inspect destination `{}`",
+                    canon_target.display()
+                ),
+                e,
+            )
+        })?;
+
+        // Mirror the old BSD-tar compatibility case in `unpack` so that the
+        // final verification knows what kind of object to expect.
+        let bsd_dir = self.header.as_ustar().is_none() && self.path_bytes().ends_with(b"/");
+
+        let unpacked = self
+            .unpack(Some(&canon_target), &file_dst)
             .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
+
+        // Final commit boundary: re-verify the root and object identity now
+        // that the entry's data has been written. If a previously committed
+        // symlink (or the root itself) was redirected by another process
+        // while we were writing, this detects it and leaves a reviewable
+        // security record in the extraction root.
+        if let Err(e) = root_guard.verify_commit(
+            dst,
+            parent,
+            &file_dst,
+            &unpacked,
+            self.header.entry_type(),
+            bsd_dir,
+        ) {
+            root_guard.write_security_record(dst, &self.path_lossy(), &e);
+            return Err(e);
+        }
 
         Ok(true)
     }
@@ -954,6 +996,302 @@ impl<'a> EntryFields<'a> {
         }
         Ok(canon_target)
     }
+}
+
+/// Name of the file that `unpack_in` appends a security record to in the
+/// extraction root when the final commit-boundary verification detects that
+/// the destination tree was concurrently modified.
+const UNPACK_SECURITY_RECORD_NAME: &str = ".tar-unpack-security-record";
+
+/// Permissions of the security record file: readable by everyone, writable
+/// only by the owner, matching the usual convention for log files.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+const UNPACK_SECURITY_RECORD_MODE: u32 = 0o644;
+
+/// Builds the error returned when the final commit-boundary verification in
+/// `unpack_in` detects concurrent modification of the destination tree.
+fn unpack_redirected(what: String) -> io::Error {
+    TarError::new(
+        format!("destination changed while unpacking: {}", what),
+        Error::new(ErrorKind::Other, "concurrent modification detected"),
+    )
+    .into()
+}
+
+/// Identity of a filesystem object, used to detect replacement of the
+/// extraction root or of a just-written entry by another process.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[derive(PartialEq, Eq, Debug)]
+struct ObjectIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+impl ObjectIdentity {
+    fn of(md: &fs::Metadata) -> ObjectIdentity {
+        use std::os::unix::fs::MetadataExt;
+
+        ObjectIdentity {
+            dev: md.dev(),
+            ino: md.ino(),
+        }
+    }
+}
+
+/// Captures the identity of the extraction root at the start of
+/// `Entry::unpack_in` so that at the final commit boundary (after the
+/// entry's data has been written) we can re-verify that neither the root
+/// nor the just-written object was redirected by another process, e.g. by
+/// atomically swapping a previously committed symlink.
+///
+/// This is a best-effort hardening measure; fully closing the TOCTOU window
+/// requires `openat`-style resolution of every path component, which this
+/// crate does not do. See the crate-level security documentation.
+struct UnpackRootGuard {
+    /// Canonical path of the extraction root, as validated before unpack.
+    canon: PathBuf,
+    /// Identity of the extraction root directory itself.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    id: ObjectIdentity,
+    /// Handle to the extraction root directory, held open so that a
+    /// security record can be written into the *original* root directory
+    /// even if the path leading to it has been replaced in the meantime.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    dir: fs::File,
+}
+
+impl UnpackRootGuard {
+    fn new(canon_target: &Path) -> io::Result<UnpackRootGuard> {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            let dir = fs::File::open(canon_target)?;
+            let id = ObjectIdentity::of(&dir.metadata()?);
+            Ok(UnpackRootGuard {
+                canon: canon_target.to_path_buf(),
+                id,
+                dir,
+            })
+        }
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        {
+            Ok(UnpackRootGuard {
+                canon: canon_target.to_path_buf(),
+            })
+        }
+    }
+
+    /// Re-verifies that `dst` still resolves to the extraction root that was
+    /// validated before unpacking.
+    fn verify_root(&self, dst: &Path) -> io::Result<()> {
+        let canon = dst.canonicalize().map_err(|e| {
+            TarError::new(
+                format!("failed to re-verify destination `{}`", dst.display()),
+                e,
+            )
+        })?;
+        if canon != self.canon {
+            return Err(unpack_redirected(format!(
+                "extraction root `{}` now resolves to `{}`",
+                self.canon.display(),
+                canon.display()
+            )));
+        }
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            // The canonical path alone does not detect a rename swap of the
+            // root directory, so also compare the object identity.
+            let md = fs::metadata(dst).map_err(|e| {
+                TarError::new(
+                    format!("failed to re-verify destination `{}`", dst.display()),
+                    e,
+                )
+            })?;
+            if ObjectIdentity::of(&md) != self.id {
+                return Err(unpack_redirected(format!(
+                    "extraction root `{}` was replaced",
+                    self.canon.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-verifies, after `unpack` has completed, that the extraction root
+    /// and the object at `file_dst` are the same ones that were validated
+    /// before unpacking. `kind` and `bsd_dir` describe the entry that was
+    /// unpacked, mirroring the dispatch in `unpack`.
+    fn verify_commit(
+        &self,
+        dst: &Path,
+        parent: &Path,
+        file_dst: &Path,
+        unpacked: &Unpacked,
+        kind: EntryType,
+        bsd_dir: bool,
+    ) -> io::Result<()> {
+        self.verify_root(dst)?;
+
+        // Re-check that the parent directory of the unpacked entry still
+        // resolves inside the extraction root; a previously committed
+        // symlink may have been redirected in the meantime.
+        let canon_parent = parent.canonicalize().map_err(|e| {
+            TarError::new(
+                format!("failed to re-verify `{}` after unpack", parent.display()),
+                e,
+            )
+        })?;
+        if !canon_parent.starts_with(&self.canon) {
+            return Err(unpack_redirected(format!(
+                "parent directory `{}` was redirected outside of `{}`",
+                parent.display(),
+                self.canon.display()
+            )));
+        }
+
+        // Finally verify the identity of the object that was just written.
+        match unpacked {
+            Unpacked::File(f) => {
+                // Compare the open handle against what the path resolves to
+                // now; if a component of the path was redirected after the
+                // file was created, the lookup either fails or yields a
+                // different object.
+                let on_disk = fs::metadata(file_dst).map_err(|e| {
+                    TarError::new(
+                        format!("failed to re-verify `{}` after unpack", file_dst.display()),
+                        e,
+                    )
+                })?;
+                #[cfg(all(unix, not(target_arch = "wasm32")))]
+                {
+                    let written = f.metadata().map_err(|e| {
+                        TarError::new(
+                            format!("failed to re-verify `{}` after unpack", file_dst.display()),
+                            e,
+                        )
+                    })?;
+                    if ObjectIdentity::of(&written) != ObjectIdentity::of(&on_disk) {
+                        return Err(unpack_redirected(format!(
+                            "`{}` no longer refers to the file that was written",
+                            file_dst.display()
+                        )));
+                    }
+                }
+                // On platforms without a portable object identity the
+                // existence check above is all that can be done here.
+                #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+                let _ = (f, on_disk);
+            }
+            Unpacked::__Nonexhaustive => {
+                if kind.is_pax_global_extensions()
+                    || kind.is_pax_local_extensions()
+                    || kind.is_gnu_longname()
+                    || kind.is_gnu_longlink()
+                {
+                    // Nothing is created for pax/gnu metadata entries.
+                    return Ok(());
+                }
+                // Mirror the dispatch in `unpack`: links keep their link
+                // type, and the old BSD-tar compatibility case that treats
+                // trailing-slash names as directories only applies to
+                // non-link entries.
+                let expect_symlink = kind.is_symlink();
+                let expect_dir = kind.is_dir()
+                    || (bsd_dir && !expect_symlink && !kind.is_hard_link());
+                let md = fs::symlink_metadata(file_dst).map_err(|e| {
+                    TarError::new(
+                        format!("failed to re-verify `{}` after unpack", file_dst.display()),
+                        e,
+                    )
+                })?;
+                let ok = if expect_symlink {
+                    md.file_type().is_symlink()
+                } else if expect_dir {
+                    md.is_dir()
+                } else {
+                    // For hard links the existence of the object at the
+                    // expected path is sufficient here.
+                    true
+                };
+                if !ok {
+                    return Err(unpack_redirected(format!(
+                        "`{}` no longer has the expected file type",
+                        file_dst.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends a human-reviewable record of a detected concurrent
+    /// modification to the security record file in the extraction root.
+    /// This is best-effort: the original error is always returned to the
+    /// caller regardless of whether the record could be written.
+    fn write_security_record(&self, _dst: &Path, entry: &str, err: &io::Error) {
+        let time_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = format!(
+            "tar-rs unpack_in: destination changed during extraction\n\
+             time_unix={}\n\
+             entry={}\n\
+             root={}\n\
+             error={}\n\n",
+            time_unix,
+            entry,
+            self.canon.display(),
+            err
+        );
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            let _ = append_to_dir(&self.dir, UNPACK_SECURITY_RECORD_NAME, record.as_bytes());
+        }
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        {
+            // Only write into the root if it still resolves to the directory
+            // that was validated; otherwise its path may lead somewhere we
+            // must not write.
+            if self.verify_root(_dst).is_ok() {
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.canon.join(UNPACK_SECURITY_RECORD_NAME))
+                    .and_then(|mut f| f.write_all(record.as_bytes()));
+            }
+        }
+    }
+}
+
+/// Appends `record` to the file `name` inside the directory open as `dir`.
+///
+/// Going through the directory file descriptor (rather than a path) ensures
+/// the record lands in the original extraction root even if the path to it
+/// was replaced by a concurrent process.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn append_to_dir(dir: &fs::File, name: &str, record: &[u8]) -> io::Result<()> {
+    use std::os::unix::prelude::*;
+
+    let name = std::ffi::CString::new(name)
+        .map_err(|e| Error::new(ErrorKind::Other, format!("invalid file name: {:?}", e)))?;
+    // SAFETY: `name` is a valid NUL-terminated string and `dir` is an open
+    // file descriptor; the returned descriptor (if any) is immediately
+    // wrapped in a `File` which takes ownership of it.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            UNPACK_SECURITY_RECORD_MODE,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a valid, owned file descriptor returned by openat.
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    f.write_all(record)
 }
 
 impl<'a> Read for EntryFields<'a> {

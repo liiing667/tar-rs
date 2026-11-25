@@ -2168,3 +2168,272 @@ async fn pax_extension_header_matches_astral_tokio_tar() {
         "astral-tokio-tar produced unexpected entries\ngot: {async_entries:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Tests for the final commit-boundary re-verification in `unpack_in`:
+// after an entry has been written, the extraction root and the written
+// object are re-checked so that a concurrent process redirecting a
+// previously committed symlink (or the root itself) is detected and a
+// reviewable security record is left in the extraction root.
+// ---------------------------------------------------------------------
+
+/// Name of the record file written to the extraction root on detection.
+#[cfg(unix)]
+const SECURITY_RECORD_NAME: &str = ".tar-unpack-security-record";
+
+/// Builds an in-memory archive containing a `real/` directory, a legitimate
+/// same-root `sub -> real` symlink, and a `sub/pwn` file written through
+/// that symlink.
+#[cfg(unix)]
+fn build_same_root_link_archive(payload: &[u8]) -> Vec<u8> {
+    let mut ar = Builder::new(Vec::new());
+    let mut header = Header::new_gnu();
+
+    header.set_entry_type(EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_path("real").unwrap();
+    header.set_cksum();
+    ar.append(&header, io::empty()).unwrap();
+
+    header.set_entry_type(EntryType::Symlink);
+    header.set_size(0);
+    header.set_path("sub").unwrap();
+    header.set_cksum();
+    ar.append_link(&mut header, "sub", "real").unwrap();
+
+    header.set_entry_type(EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(payload.len() as u64);
+    header.set_path("sub/pwn").unwrap();
+    header.set_cksum();
+    ar.append(&header, payload).unwrap();
+
+    ar.finish().unwrap();
+    ar.into_inner().unwrap()
+}
+
+/// A reader that runs `action` the first time `trigger` exists when data is
+/// read, i.e. after `unpack_in` has validated the destination and created
+/// the output file, but before the final commit-boundary re-verification.
+/// This deterministically simulates another process racing the unpack.
+#[cfg(unix)]
+struct RedirectOnRead<R> {
+    inner: R,
+    trigger: PathBuf,
+    action: Option<Box<dyn FnMut() -> io::Result<()>>>,
+}
+
+#[cfg(unix)]
+impl<R: Read> Read for RedirectOnRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.trigger.exists() {
+            if let Some(mut action) = self.action.take() {
+                action()?;
+            }
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Unpacks every entry of `ar` under `dst` with the public `unpack_in`,
+/// returning the first error encountered, if any.
+#[cfg(unix)]
+fn unpack_entries_in<R: Read>(ar: &mut Archive<R>, dst: &Path) -> Option<io::Error> {
+    for entry in ar.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if let Err(e) = entry.unpack_in(dst) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+#[test]
+#[cfg(unix)]
+fn unpack_in_same_root_links_and_normal_unpack_unaffected() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let dst = td.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    // A legitimate same-root symlink committed by the archive itself, with
+    // a file written through it, must keep working.
+    let archive = build_same_root_link_archive(b"hello");
+    let mut ar = Archive::new(Cursor::new(archive));
+    assert!(unpack_entries_in(&mut ar, &dst).is_none());
+    assert_eq!(fs::read(dst.join("real/pwn")).unwrap(), b"hello");
+    let md = fs::symlink_metadata(dst.join("sub")).unwrap();
+    assert!(md.file_type().is_symlink());
+
+    // A pre-existing on-disk same-root symlink must also keep working.
+    let link_dst = td.path().join("dst2");
+    fs::create_dir(&link_dst).unwrap();
+    fs::create_dir(link_dst.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", link_dst.join("link")).unwrap();
+    let mut ar = Builder::new(Vec::new());
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(5);
+    header.set_path("link/file.txt").unwrap();
+    header.set_cksum();
+    ar.append(&header, &b"world"[..]).unwrap();
+    ar.finish().unwrap();
+    let mut ar = Archive::new(Cursor::new(ar.into_inner().unwrap()));
+    ar.unpack(&link_dst).unwrap();
+    assert_eq!(fs::read(link_dst.join("real/file.txt")).unwrap(), b"world");
+
+    // No security record may be left behind on a clean unpack.
+    assert!(!dst.join(SECURITY_RECORD_NAME).exists());
+    assert!(!link_dst.join(SECURITY_RECORD_NAME).exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unpack_in_non_ustar_trailing_slash_links_not_flagged() {
+    // Non-ustar (e.g. GNU-magic or V7) headers activate the old BSD-tar
+    // compatibility rule that treats trailing-slash names as directories,
+    // but in `unpack` link entries take precedence over that rule. The
+    // final commit-boundary re-verification must mirror the same
+    // precedence and must not flag these legitimate entries.
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let dst = td.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let mut ar = Builder::new(Vec::new());
+    let mut header = Header::new_gnu();
+
+    // regular file "a"
+    header.set_entry_type(EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(1);
+    header.set_path("a").unwrap();
+    header.set_cksum();
+    ar.append(&header, &b"x"[..]).unwrap();
+
+    // hard link "b/" -> "a" (trailing slash, non-ustar header)
+    header.set_entry_type(EntryType::Link);
+    header.set_size(0);
+    header.set_path("b/").unwrap();
+    header.set_cksum();
+    ar.append_link(&mut header, "b/", "a").unwrap();
+
+    // directory "real/" (trailing slash, non-ustar header)
+    header.set_entry_type(EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_path("real/").unwrap();
+    header.set_cksum();
+    ar.append(&header, io::empty()).unwrap();
+
+    // symlink "sub/" -> "real" (trailing slash, non-ustar header)
+    header.set_entry_type(EntryType::Symlink);
+    header.set_size(0);
+    header.set_path("sub/").unwrap();
+    header.set_cksum();
+    ar.append_link(&mut header, "sub/", "real").unwrap();
+
+    ar.finish().unwrap();
+    let mut ar = Archive::new(Cursor::new(ar.into_inner().unwrap()));
+    assert!(unpack_entries_in(&mut ar, &dst).is_none());
+
+    assert!(fs::symlink_metadata(dst.join("sub"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(dst.join("b")).unwrap(), b"x");
+    assert!(dst.join("real").is_dir());
+    assert!(!dst.join(SECURITY_RECORD_NAME).exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unpack_in_detects_symlink_redirect_during_unpack() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let dst = td.path().join("dst");
+    let outside = td.path().join("outside");
+    fs::create_dir(&dst).unwrap();
+    fs::create_dir(&outside).unwrap();
+
+    let archive = build_same_root_link_archive(b"pwned");
+
+    // Once `sub/pwn` has been created, another process redirects the
+    // previously committed `sub` symlink to point outside the root.
+    let link = dst.join("sub");
+    let new_target = outside.clone();
+    let reader = RedirectOnRead {
+        inner: Cursor::new(archive),
+        trigger: dst.join("sub").join("pwn"),
+        action: Some(Box::new(move || {
+            fs::remove_file(&link)?;
+            std::os::unix::fs::symlink(&new_target, &link)?;
+            Ok(())
+        })),
+    };
+
+    let mut ar = Archive::new(reader);
+    let err = unpack_entries_in(&mut ar, &dst)
+        .expect("unpack_in must fail when a committed symlink is redirected");
+    assert!(
+        err.to_string().contains("destination changed"),
+        "unexpected error: {}",
+        err
+    );
+
+    // The write must not have escaped the extraction root.
+    assert!(!outside.join("pwn").exists());
+    assert_eq!(fs::read(dst.join("real/pwn")).unwrap(), b"pwned");
+
+    // A reviewable security record must have been left in the root.
+    let record = fs::read_to_string(dst.join(SECURITY_RECORD_NAME)).unwrap();
+    assert!(record.contains("entry=sub/pwn"), "record: {}", record);
+}
+
+#[test]
+#[cfg(unix)]
+fn unpack_in_detects_root_replacement_during_unpack() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let dst = td.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let payload = b"data";
+    let mut ar = Builder::new(Vec::new());
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(payload.len() as u64);
+    header.set_path("f").unwrap();
+    header.set_cksum();
+    ar.append(&header, &payload[..]).unwrap();
+    ar.finish().unwrap();
+    let archive = ar.into_inner().unwrap();
+
+    // Once `f` has been created, another process replaces the extraction
+    // root itself with a different directory at the same path.
+    let renamed = td.path().join("dst-original");
+    let dst2 = dst.clone();
+    let renamed2 = renamed.clone();
+    let reader = RedirectOnRead {
+        inner: Cursor::new(archive),
+        trigger: dst.join("f"),
+        action: Some(Box::new(move || {
+            fs::rename(&dst2, &renamed2)?;
+            fs::create_dir(&dst2)?;
+            Ok(())
+        })),
+    };
+
+    let mut ar = Archive::new(reader);
+    let err = unpack_entries_in(&mut ar, &dst)
+        .expect("unpack_in must fail when the extraction root is replaced");
+    assert!(
+        err.to_string().contains("destination changed"),
+        "unexpected error: {}",
+        err
+    );
+
+    // The security record is written through the handle to the original
+    // root directory, so it is reviewable at its new (renamed) location.
+    let record = fs::read_to_string(renamed.join(SECURITY_RECORD_NAME)).unwrap();
+    assert!(record.contains("entry=f"), "record: {}", record);
+}

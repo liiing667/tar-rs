@@ -23,6 +23,19 @@
 //! where the destination may be concurrently modified, use the [`cap-std`]
 //! crate and/or OS-level sandboxing.
 //!
+//! As a best-effort hardening measure, [`Entry::unpack_in`] re-verifies at
+//! the final commit boundary (after each entry's data has been written) that
+//! the extraction root and the just-written object still have the identity
+//! that was validated before unpacking. If a concurrent process redirected
+//! a previously committed symlink — or replaced the root itself — while the
+//! entry was being written, the unpack fails with an error and a
+//! human-reviewable record is appended to `.tar-unpack-security-record` in
+//! the extraction root. This detects such races after the fact; it cannot
+//! prevent them, and it is not a substitute for the sandboxing recommended
+//! above. The re-verification is strongest on Unix, where object identity
+//! (device/inode) is compared; on other platforms only path resolution is
+//! re-checked.
+//!
 //! [`cap-std`]: https://docs.rs/cap-std/
 
 // More docs about the detailed tar format can also be found here:
