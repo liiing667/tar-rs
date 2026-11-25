@@ -1442,6 +1442,154 @@ fn sparse_with_trailing() {
     assert_eq!(&s[0x100_000..], "1MB through\n");
 }
 
+/// Builds an in-memory archive holding a single GNU sparse entry whose file
+/// content is `data`, stored after a hole of `hole` bytes. The archive
+/// itself stays tiny no matter how large `hole` is, which is exactly what
+/// makes sparse bombs cheap to construct.
+fn sparse_archive_bytes(hole: u64, data: &[u8]) -> Vec<u8> {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::GNUSparse);
+    header.set_path("sparse-file").unwrap();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    {
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(hole + data.len() as u64);
+        gnu.sparse[0].set_offset(hole);
+        gnu.sparse[0].set_length(data.len() as u64);
+    }
+    header.set_cksum();
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(data);
+    // Pad the data to a 512-byte boundary and append the end-of-archive
+    // zero blocks.
+    let pad = (512 - data.len() % 512) % 512;
+    bytes.extend(repeat(0u8).take(pad + 1024));
+    bytes
+}
+
+#[test]
+fn sparse_bomb_rejected_by_default_quota() {
+    // A tiny archive declaring a 2 TiB sparse file exceeds the default
+    // quota (1 TiB) and must be rejected before anything is published.
+    let ar_bytes = sparse_archive_bytes(2 << 40, b"hello");
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let mut ar = Archive::new(Cursor::new(ar_bytes));
+    let mut entries = ar.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+
+    // Reading the entry is not quota-checked; only unpacking is.
+    let err = entry.unpack_in(td.path()).unwrap_err();
+    // The quota error is wrapped by context added while unpacking, so walk
+    // the whole error chain.
+    let mut chain = String::new();
+    let mut source: Option<&dyn std::error::Error> = Some(&err);
+    while let Some(e) = source {
+        chain.push_str(&e.to_string());
+        source = e.source();
+    }
+    assert!(
+        chain.contains("exceeding the configured maximum"),
+        "unexpected error: {}",
+        chain
+    );
+    assert!(!td.path().join("sparse-file").exists());
+
+    // The direct `Entry::unpack` path shares the same validation; the
+    // entry is still usable because validation fails before any data is
+    // consumed.
+    let err = entry.unpack(td.path().join("direct")).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeding the configured maximum"),
+        "unexpected error: {}",
+        err
+    );
+    assert!(!td.path().join("direct").exists());
+}
+
+#[test]
+fn sparse_expansion_quota() {
+    let data = b"hello";
+    let hole = 1024 * 1024; // 1 MiB hole
+    let logical = hole + data.len() as u64;
+
+    // `None` leaves the default quota (1 TiB) in place.
+    let cases: &[(Option<u64>, bool)] = &[
+        (None, true),
+        (Some(u64::MAX), true), // quota disabled
+        (Some(logical), true),  // exactly at the quota
+        (Some(logical - 1), false),
+        (Some(0), false),
+    ];
+    for &(quota, should_unpack) in cases {
+        let ar_bytes = sparse_archive_bytes(hole, data);
+        let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+        let mut ar = Archive::new(Cursor::new(ar_bytes));
+        if let Some(quota) = quota {
+            ar.set_max_sparse_unpacked_size(quota);
+        }
+        let result = ar.unpack(td.path());
+        let unpacked = td.path().join("sparse-file");
+        if should_unpack {
+            result.unwrap();
+            assert_eq!(fs::metadata(&unpacked).unwrap().len(), logical);
+            let mut s = String::new();
+            File::open(&unpacked)
+                .unwrap()
+                .read_to_string(&mut s)
+                .unwrap();
+            assert_eq!(&s[s.len() - data.len()..], "hello");
+            assert!(s[..hole as usize].chars().all(|x| x == '\u{0}'));
+        } else {
+            assert!(result.is_err());
+            // A rejected entry is never published.
+            assert!(!unpacked.exists());
+        }
+    }
+}
+
+#[test]
+fn sparse_quota_configurable_per_entry() {
+    let ar_bytes = sparse_archive_bytes(1024 * 1024, b"hello");
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let mut ar = Archive::new(Cursor::new(ar_bytes));
+    ar.set_max_sparse_unpacked_size(0); // reject everything sparse
+    let mut entries = ar.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    entry.set_max_sparse_unpacked_size(u64::MAX); // entry-level override
+    assert!(entry.unpack_in(td.path()).unwrap());
+    assert_eq!(
+        fs::metadata(td.path().join("sparse-file")).unwrap().len(),
+        1024 * 1024 + 5
+    );
+}
+
+#[test]
+fn regular_file_not_subject_to_sparse_quota() {
+    // The quota only guards sparse expansion; regular files are bounded by
+    // the archive size itself and must unpack even with a zero quota.
+    let mut ar_bytes = Vec::new();
+    {
+        let mut builder = Builder::new(&mut ar_bytes);
+        let mut header = Header::new_gnu();
+        header.set_size(5);
+        builder
+            .append_data(&mut header, "regular-file", &b"hello"[..])
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let mut ar = Archive::new(Cursor::new(ar_bytes));
+    ar.set_max_sparse_unpacked_size(0);
+    ar.unpack(td.path()).unwrap();
+    assert_eq!(fs::read(td.path().join("regular-file")).unwrap(), b"hello");
+}
+
 #[test]
 #[allow(clippy::option_map_unit_fn)]
 fn writing_sparse() {

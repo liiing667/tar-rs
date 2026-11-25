@@ -14,6 +14,13 @@
 //! directory: paths containing `..` are rejected, and symlink targets within
 //! the archive are validated before use.
 //!
+//! Sparse entries are additionally guarded against "sparse bomb" attacks: a
+//! sparse entry may declare a logical size vastly larger than the data
+//! stored in the archive, so before a sparse file is created on disk its
+//! total expanded size is validated against a configurable quota (see
+//! [`Archive::set_max_sparse_unpacked_size`]). A rejected entry is never
+//! published to the destination.
+//!
 //! **Concurrent mutation of the destination tree is outside the threat model.**
 //! If another process modifies the destination (for example, by atomically
 //! swapping a symlink) while extraction is in progress, this crate may follow
@@ -43,7 +50,7 @@ use std::io::{Error, ErrorKind};
 
 pub use crate::archive::{Archive, Entries};
 pub use crate::builder::{Builder, EntryWriter};
-pub use crate::entry::{Entry, Unpacked};
+pub use crate::entry::{Entry, Unpacked, DEFAULT_MAX_SPARSE_UNPACKED_SIZE};
 pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;
 #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]

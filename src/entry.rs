@@ -15,6 +15,16 @@ use crate::header::bytes2path;
 use crate::other;
 use crate::{Archive, Header, PaxExtensions};
 
+/// Default upper bound on the total expanded (logical) size that a sparse
+/// entry may have when it is unpacked.
+///
+/// A sparse entry's logical size is attacker-controlled and can be vastly
+/// larger than the data stored in the archive, so unpacking is guarded by
+/// this quota. 1 TiB is chosen as a default that keeps legitimate sparse
+/// files (e.g. virtual disk images) working while rejecting absurd
+/// expansions; see `Archive::set_max_sparse_unpacked_size` to tune it.
+pub const DEFAULT_MAX_SPARSE_UNPACKED_SIZE: u64 = 1 << 40;
+
 /// A read-only view into an entry of an archive.
 ///
 /// This structure is a window into a portion of a borrowed archive which can
@@ -42,6 +52,7 @@ pub struct EntryFields<'a> {
     pub preserve_ownerships: bool,
     pub preserve_mtime: bool,
     pub overwrite: bool,
+    pub max_sparse_unpacked_size: u64,
 }
 
 pub enum EntryIo<'a> {
@@ -274,6 +285,23 @@ impl<'a, R: Read> Entry<'a, R> {
     pub fn set_preserve_mtime(&mut self, preserve: bool) {
         self.fields.preserve_mtime = preserve;
     }
+
+    /// Set the maximum total size a sparse entry is allowed to expand to
+    /// when it is unpacked.
+    ///
+    /// Sparse entries declare a logical size that may be much larger than
+    /// the data stored in the archive; the holes are recreated on disk when
+    /// unpacking. A malicious archive can declare an enormous logical size
+    /// to exhaust the consumer's disk ("sparse bomb"). Before the
+    /// destination file is created, the total expansion of a sparse entry
+    /// is validated against this quota and rejected if it exceeds it.
+    ///
+    /// The quota only applies to sparse entries; the expansion of regular
+    /// files is bounded by the archive itself. The default is 1 TiB; use
+    /// `u64::MAX` to disable the quota.
+    pub fn set_max_sparse_unpacked_size(&mut self, size: u64) {
+        self.fields.max_sparse_unpacked_size = size;
+    }
 }
 
 impl<'a, R: Read> Read for Entry<'a, R> {
@@ -457,6 +485,39 @@ impl<'a> EntryFields<'a> {
                 format!("{} when creating dir {}", err, dst.display()),
             ))
         })
+    }
+
+    /// Validates that the total size a sparse entry expands to on unpack
+    /// (data plus holes) does not exceed `max_sparse_unpacked_size`.
+    ///
+    /// Entries without holes are not sparse and are always accepted: their
+    /// expansion is bounded by the amount of data in the archive itself.
+    fn validate_sparse_expansion(&self) -> io::Result<()> {
+        let mut total = 0u64;
+        let mut sparse = false;
+        for segment in &self.data {
+            let len = match segment {
+                EntryIo::Data(d) => d.limit(),
+                EntryIo::Pad(d) => {
+                    sparse = true;
+                    d.limit()
+                }
+            };
+            total = total
+                .checked_add(len)
+                .ok_or_else(|| other("sparse file expansion overflows u64"))?;
+        }
+        if sparse && total > self.max_sparse_unpacked_size {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "sparse entry expands to {} bytes, exceeding the \
+                     configured maximum of {} bytes",
+                    total, self.max_sparse_unpacked_size
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns access to the header of this entry in the archive.
@@ -643,6 +704,14 @@ impl<'a> EntryFields<'a> {
         //
         // As a result if we don't recognize the kind we just write out the file
         // as we would normally.
+
+        // A sparse entry declares a logical size that can be vastly larger
+        // than the data stored in the archive; expanding it without a bound
+        // lets a tiny archive exhaust the consumer's disk ("sparse bomb").
+        // Validate the total expansion against the configured quota *before*
+        // the destination file is created, so a rejected entry is never
+        // published.
+        self.validate_sparse_expansion()?;
 
         // Ensure we write a new file rather than overwriting in-place which
         // is attackable; if an existing file is found unlink it.

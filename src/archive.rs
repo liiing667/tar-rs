@@ -7,7 +7,7 @@ use std::io::{self, SeekFrom};
 use std::marker;
 use std::path::Path;
 
-use crate::entry::{EntryFields, EntryIo};
+use crate::entry::{EntryFields, EntryIo, DEFAULT_MAX_SPARSE_UNPACKED_SIZE};
 use crate::error::TarError;
 use crate::header::BLOCK_SIZE;
 use crate::other;
@@ -30,6 +30,7 @@ pub struct ArchiveInner<R: ?Sized> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
+    max_sparse_unpacked_size: u64,
     obj: RefCell<R>,
 }
 
@@ -62,6 +63,7 @@ impl<R: Read> Archive<R> {
                 preserve_mtime: true,
                 overwrite: true,
                 ignore_zeros: false,
+                max_sparse_unpacked_size: DEFAULT_MAX_SPARSE_UNPACKED_SIZE,
                 obj: RefCell::new(obj),
                 pos: Cell::new(0),
             },
@@ -175,6 +177,23 @@ impl<R: Read> Archive<R> {
     /// This can be used in case multiple tar archives have been concatenated together.
     pub fn set_ignore_zeros(&mut self, ignore_zeros: bool) {
         self.inner.ignore_zeros = ignore_zeros;
+    }
+
+    /// Set the maximum total size a sparse entry is allowed to expand to
+    /// when it is unpacked.
+    ///
+    /// Sparse entries declare a logical size that may be much larger than
+    /// the data stored in the archive; the holes are recreated on disk when
+    /// unpacking. A malicious archive can declare an enormous logical size
+    /// to exhaust the consumer's disk ("sparse bomb"). Before the
+    /// destination file is created, the total expansion of a sparse entry
+    /// is validated against this quota and rejected if it exceeds it.
+    ///
+    /// The quota only applies to sparse entries; the expansion of regular
+    /// files is bounded by the archive itself. The default is 1 TiB; use
+    /// `u64::MAX` to disable the quota.
+    pub fn set_max_sparse_unpacked_size(&mut self, size: u64) {
+        self.inner.max_sparse_unpacked_size = size;
     }
 }
 
@@ -368,6 +387,7 @@ impl<'a> EntriesFields<'a> {
             preserve_mtime: self.archive.inner.preserve_mtime,
             overwrite: self.archive.inner.overwrite,
             preserve_ownerships: self.archive.inner.preserve_ownerships,
+            max_sparse_unpacked_size: self.archive.inner.max_sparse_unpacked_size,
         };
 
         // Store where the next entry is, rounding up by 512 bytes (the size of
