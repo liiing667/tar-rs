@@ -443,6 +443,339 @@ fn extracting_duplicate_link_succeed() {
     ar.unpack(td.path()).unwrap();
 }
 
+/// Build an in-memory archive containing regular files with the given
+/// `(path, contents)` pairs, in order.
+fn archive_with_files(entries: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
+    let mut ar = Builder::new(Vec::new());
+    for (path, contents) in entries {
+        let mut header = Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        ar.append_data(&mut header, *path, *contents).unwrap();
+    }
+    Cursor::new(ar.into_inner().unwrap())
+}
+
+/// One raw entry for [`raw_tar`]: the path is copied byte-for-byte into the
+/// header, so spellings that `Builder` normalizes away (`.` components,
+/// repeated separators) can be embedded to simulate a malicious archive.
+struct RawEntry {
+    path: &'static str,
+    kind: EntryType,
+    data: &'static [u8],
+    link_name: Option<&'static str>,
+}
+
+/// Build a minimal old-style tar archive without any path normalization,
+/// padding every data section up to a 512-byte boundary and terminating the
+/// archive with two zero blocks.
+fn raw_tar(entries: &[RawEntry]) -> Cursor<Vec<u8>> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let mut header = Header::new_old();
+        let bytes = header.as_mut_bytes();
+        let name = entry.path.as_bytes();
+        bytes[..name.len()].copy_from_slice(name);
+        bytes[100..108].copy_from_slice(b"0000644\0");
+        let size = format!("{:011o}\0", entry.data.len());
+        bytes[124..136].copy_from_slice(size.as_bytes());
+        bytes[156] = entry.kind.as_byte();
+        if let Some(link_name) = entry.link_name {
+            let raw = link_name.as_bytes();
+            bytes[157..157 + raw.len()].copy_from_slice(raw);
+        }
+        header.set_cksum();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(entry.data);
+        let padded = (entry.data.len() + 511) & !511;
+        out.extend(std::iter::repeat(0u8).take(padded - entry.data.len()));
+    }
+    out.extend([0u8; 1024]);
+    Cursor::new(out)
+}
+
+/// The core attack: two entries whose raw paths differ only by dot/separator
+/// spelling resolve to the same normalized path identity. Even with
+/// `overwrite` enabled, the second entry must not replace the file committed
+/// by the first one.
+#[test]
+fn normalized_path_conflict_dot_variant_rejected_even_with_overwrite() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: "dir/file",
+            kind: EntryType::Regular,
+            data: b"benign-first-copy",
+            link_name: None,
+        },
+        RawEntry {
+            path: "./dir/./file",
+            kind: EntryType::Regular,
+            data: b"malicious-second-copy",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    let err = ar.unpack(td.path()).expect_err("conflict must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+
+    // The first, benign file must remain untouched on disk.
+    assert_eq!(
+        fs::read(td.path().join("dir/file")).unwrap(),
+        b"benign-first-copy"
+    );
+
+    // A reviewable security record must be left in the extraction root.
+    let record = fs::read_to_string(td.path().join(".tar-extraction-security.log")).unwrap();
+    assert!(record.contains("rejected_conflicts=1"), "record was: {record}");
+    assert!(
+        record.contains("normalized_path=\"dir/file\""),
+        "record was: {record}"
+    );
+    assert!(record.contains("./dir/./file"), "record was: {record}");
+    assert!(record.contains("dir/file"), "record was: {record}");
+}
+
+/// Repeated and leading/trailing separators are the same normalized identity
+/// and must not be usable to overwrite a committed file.
+#[test]
+fn normalized_path_conflict_separator_variant_rejected() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: "a/b/c",
+            kind: EntryType::Regular,
+            data: b"first",
+            link_name: None,
+        },
+        RawEntry {
+            path: "a//b///c",
+            kind: EntryType::Regular,
+            data: b"second",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path()).expect_err("conflict must be rejected");
+    assert_eq!(fs::read(td.path().join("a/b/c")).unwrap(), b"first");
+}
+
+/// Absolute-looking and `./`-prefixed spellings collapse onto the same
+/// relative identity and cannot be used to overwrite a committed entry.
+#[test]
+fn normalized_path_conflict_leading_slash_variant_rejected() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: "etc/config",
+            kind: EntryType::Regular,
+            data: b"trusted",
+            link_name: None,
+        },
+        RawEntry {
+            path: "/etc/./config",
+            kind: EntryType::Regular,
+            data: b"tampered",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path()).expect_err("conflict must be rejected");
+    assert_eq!(
+        fs::read(td.path().join("etc/config")).unwrap(),
+        b"trusted"
+    );
+}
+
+/// Entries with genuinely different paths are distinct identities and must
+/// continue to extract side by side.
+#[test]
+fn different_normalized_paths_coexist() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = archive_with_files(&[
+        ("./dir/file", b"one"),
+        ("dir/other", b"two"),
+        ("dir2/file", b"three"),
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path()).unwrap();
+    assert_eq!(fs::read(td.path().join("dir/file")).unwrap(), b"one");
+    assert_eq!(fs::read(td.path().join("dir/other")).unwrap(), b"two");
+    assert_eq!(fs::read(td.path().join("dir2/file")).unwrap(), b"three");
+
+    let record = fs::read_to_string(td.path().join(".tar-extraction-security.log")).unwrap();
+    assert!(record.contains("rejected_conflicts=0"), "record was: {record}");
+    assert!(
+        record.contains("committed_entries=3"),
+        "record was: {record}"
+    );
+}
+
+/// The configured overwrite policy still governs files that already exist in
+/// the destination tree before extraction; the in-archive conflict guard only
+/// compares entries against each other.
+#[test]
+fn preexisting_destination_file_still_overwritable() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    fs::write(td.path().join("present"), b"old").unwrap();
+    let rdr = archive_with_files(&[("present", b"new")]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path()).unwrap();
+    assert_eq!(fs::read(td.path().join("present")).unwrap(), b"new");
+}
+
+/// Empty directories, including repeated directory headers, remain allowed.
+#[test]
+fn empty_and_duplicate_directories_remain_allowed() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let mut builder = Builder::new(Vec::new());
+    for path in ["empty/", "empty/", "nested/deep/"] {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_data(&mut header, path, io::empty()).unwrap();
+    }
+    let rdr = Cursor::new(builder.into_inner().unwrap());
+    let mut ar = Archive::new(rdr);
+    ar.unpack(td.path()).unwrap();
+    assert!(td.path().join("empty").is_dir());
+    assert!(td.path().join("nested/deep").is_dir());
+}
+
+/// Old (non-ustar) BSD-style archives mark directories with a trailing `/`
+/// while keeping a regular-file typeflag; `unpack` materializes them as
+/// directories. Repeating such headers must be accepted just like repeated
+/// typeflag-5 directory headers, rather than being treated as a path-identity
+/// conflict.
+#[test]
+fn duplicate_old_bsd_trailing_slash_directories_remain_allowed() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: "some_dir/",
+            kind: EntryType::Regular,
+            data: b"",
+            link_name: None,
+        },
+        RawEntry {
+            path: "some_dir/",
+            kind: EntryType::Regular,
+            data: b"",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.unpack(td.path()).unwrap();
+    assert!(td.path().join("some_dir").is_dir());
+}
+
+/// An archive entry cannot pre-create or overwrite the security record that
+/// the extraction transaction writes itself.
+#[test]
+fn entry_targeting_security_record_is_rejected() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: ".tar-extraction-security.log",
+            kind: EntryType::Regular,
+            data: b"forged record",
+            link_name: None,
+        },
+        RawEntry {
+            path: "real-file",
+            kind: EntryType::Regular,
+            data: b"ok",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path())
+        .expect_err("an entry cannot claim the reserved security record path");
+
+    // The transaction still wrote its own authoritative record rather than
+    // leaving the archive-forged one behind.
+    let record = fs::read_to_string(td.path().join(".tar-extraction-security.log")).unwrap();
+    assert!(record.starts_with("# tar-rs extraction security record"));
+    assert!(!record.contains("forged record"));
+}
+
+/// An entry targeting the record's staging path is rejected too; otherwise a
+/// symlink planted there could redirect the security-record write outside the
+/// extraction root.
+#[test]
+#[cfg(unix)]
+fn entry_targeting_security_record_tmp_is_rejected() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let outside = td.path().with_extension("escaped-record");
+    let _ = fs::remove_file(&outside);
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: ".tar-extraction-security.log.tmp",
+            kind: EntryType::Symlink,
+            data: b"",
+            link_name: Some("../escaped-record"),
+        },
+        RawEntry {
+            path: "real-file",
+            kind: EntryType::Regular,
+            data: b"ok",
+            link_name: None,
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path())
+        .expect_err("an entry cannot claim the reserved staging path");
+
+    // Nothing must have been written through the symlink outside the root.
+    assert!(!outside.exists(), "record write escaped the extraction root");
+    // The authoritative record is still written inside the root.
+    assert!(td
+        .path()
+        .join(".tar-extraction-security.log")
+        .is_file());
+}
+
+/// A symlink entry spelling the same normalized path as an already committed
+/// regular file must not replace it.
+#[test]
+#[cfg(unix)]
+fn symlink_variant_cannot_replace_committed_file() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    // The second entry reaches the same destination (`target`) through a
+    // `./` spelling but is a symlink, so it must not replace the regular file.
+    let rdr = raw_tar(&[
+        RawEntry {
+            path: "target",
+            kind: EntryType::Regular,
+            data: b"data",
+            link_name: None,
+        },
+        RawEntry {
+            path: "./target",
+            kind: EntryType::Symlink,
+            data: b"",
+            link_name: Some("evil"),
+        },
+    ]);
+    let mut ar = Archive::new(rdr);
+    ar.set_overwrite(true);
+    ar.unpack(td.path()).expect_err("symlink conflict must be rejected");
+
+    let meta = fs::symlink_metadata(td.path().join("target")).unwrap();
+    assert!(meta.is_file(), "committed file must not become a symlink");
+    assert_eq!(fs::read(td.path().join("target")).unwrap(), b"data");
+}
+
 #[test]
 #[cfg(all(unix, feature = "xattr"))]
 fn xattrs() {
@@ -2043,8 +2376,6 @@ fn pax_size_smuggled_symlink() {
     );
 }
 
-/// Cross-validate that `tar` and `astral-tokio-tar` parse the PAX size
-/// smuggling archive identically, guarding against parsing differentials.
 #[tokio::test]
 async fn pax_size_smuggle_matches_astral_tokio_tar() {
     use tokio_stream::StreamExt;
@@ -2126,7 +2457,6 @@ fn pax_size_does_not_apply_to_extension_headers() {
 
 /// Cross-validate that `tar` and `astral-tokio-tar` (>= 0.6.2) parse the
 /// GHSA-3cv2-h65g-fgmm test archive identically, guarding against any future
-/// re-introduction of a parsing differential between the two crates.
 #[tokio::test]
 async fn pax_extension_header_matches_astral_tokio_tar() {
     use tokio_stream::StreamExt;

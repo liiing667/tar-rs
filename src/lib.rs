@@ -23,6 +23,21 @@
 //! where the destination may be concurrently modified, use the [`cap-std`]
 //! crate and/or OS-level sandboxing.
 //!
+//! ## Path-identity conflicts within one extraction
+//!
+//! Multiple entries in an archive may spell the same destination path in
+//! different ways (`.` components, repeated `/` separators, leading or
+//! trailing slashes, ...). [`Archive::unpack`] treats entries by their
+//! *normalized* path identity: once an entry has been committed, a later
+//! entry resolving to the same identity is rejected — even when
+//! [`Archive::set_overwrite`] is enabled — so a benign first copy of a file
+//! cannot be silently replaced by a second entry hidden behind a path-spelling
+//! variant. Entries with genuinely different paths, the configured overwrite
+//! behavior for files already present in the destination tree, and empty
+//! directories are unaffected. Every extraction writes a reviewable record of
+//! committed entries and rejected conflicts to
+//! `<destination>/.tar-extraction-security.log`.
+//!
 //! [`cap-std`]: https://docs.rs/cap-std/
 
 // More docs about the detailed tar format can also be found here:
@@ -58,6 +73,7 @@ mod entry_type;
 mod error;
 mod header;
 mod pax;
+mod transaction;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)

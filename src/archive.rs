@@ -6,12 +6,14 @@ use std::io::prelude::*;
 use std::io::{self, SeekFrom};
 use std::marker;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
 use crate::header::BLOCK_SIZE;
 use crate::other;
 use crate::pax::*;
+use crate::transaction::ExtractionTransaction;
 use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
 
 /// A top-level representation of an archive file.
@@ -156,7 +158,15 @@ impl<R: Read> Archive<R> {
         self.inner.preserve_ownerships = preserve;
     }
 
-    /// Indicate whether files and symlinks should be overwritten on extraction.
+    /// Indicate whether files and symlinks should be overwritten on extraction
+    /// when they already exist in the destination tree.
+    ///
+    /// This only governs clashes with files present *outside* the archive.
+    /// Two entries inside the same archive that resolve to the same normalized
+    /// path identity (for example `dir/file` and `./dir/./file`) are always
+    /// rejected during an [`unpack`](Archive::unpack) transaction, regardless
+    /// of this setting, so a later entry cannot silently replace a file an
+    /// earlier entry committed.
     pub fn set_overwrite(&mut self, overwrite: bool) {
         self.inner.overwrite = overwrite;
     }
@@ -232,27 +242,52 @@ impl Archive<dyn Read + '_> {
         // Delay any directory entries until the end (they will be created if needed by
         // descendants), to ensure that directory permissions do not interfere with descendant
         // extraction.
+        //
+        // A single transaction is shared with every extracted entry so that
+        // normalized path identities are tracked across the whole archive,
+        // rejecting later entries that only differ from an already committed
+        // entry by dot/separator spelling.
+        let transaction = Rc::new(RefCell::new(ExtractionTransaction::new()));
         let mut directories = Vec::new();
-        for entry in self._entries(None)? {
-            let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
-            if file.header().entry_type() == crate::EntryType::Directory {
-                directories.push(file);
-            } else {
-                file.unpack_in(dst)?;
+        let extraction = (|| -> io::Result<()> {
+            for entry in self._entries(None)? {
+                let mut file =
+                    entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
+                file.set_transaction(Rc::clone(&transaction));
+                if file.header().entry_type() == crate::EntryType::Directory {
+                    directories.push(file);
+                } else {
+                    file.unpack_in(dst)?;
+                }
             }
-        }
 
-        // Apply the directories.
-        //
-        // Note: the order of application is important to permissions. That is, we must traverse
-        // the filesystem graph in topological ordering or else we risk not being able to create
-        // child directories within those of more restrictive permissions. See [0] for details.
-        //
-        // [0]: <https://github.com/alexcrichton/tar-rs/issues/242>
-        directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
-        for mut dir in directories {
-            dir.unpack_in(dst)?;
+            // Apply the directories.
+            //
+            // Note: the order of application is important to permissions. That is, we must traverse
+            // the filesystem graph in topological ordering or else we risk not being able to create
+            // child directories within those of more restrictive permissions. See [0] for details.
+            //
+            // [0]: <https://github.com/alexcrichton/tar-rs/issues/242>
+            directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
+            for mut dir in directories {
+                dir.unpack_in(dst)?;
+            }
+            Ok(())
+        })();
+
+        // Always leave a reviewable security record in the extraction root,
+        // whether extraction succeeded or a path-identity conflict aborted it.
+        if let Err(record_err) = transaction.borrow().write_security_record(dst) {
+            return Err(TarError::new(
+                format!(
+                    "failed to write extraction security record into `{}`",
+                    dst.display()
+                ),
+                record_err,
+            )
+            .into());
         }
+        extraction?;
 
         Ok(())
     }
@@ -368,6 +403,7 @@ impl<'a> EntriesFields<'a> {
             preserve_mtime: self.archive.inner.preserve_mtime,
             overwrite: self.archive.inner.overwrite,
             preserve_ownerships: self.archive.inner.preserve_ownerships,
+            transaction: None,
         };
 
         // Store where the next entry is, rounding up by 512 bytes (the size of

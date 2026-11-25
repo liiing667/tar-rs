@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp;
 use std::fs;
 use std::fs::OpenOptions;
@@ -6,6 +7,7 @@ use std::io::prelude::*;
 use std::io::{self, Error, ErrorKind, SeekFrom};
 use std::marker;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use filetime::{self, FileTime};
 
@@ -13,6 +15,7 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::transaction::ExtractionTransaction;
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -42,6 +45,13 @@ pub struct EntryFields<'a> {
     pub preserve_ownerships: bool,
     pub preserve_mtime: bool,
     pub overwrite: bool,
+    /// Per-`Archive::unpack` transaction tracking normalized path identities
+    /// already committed, used to reject dot/separator-variant overwrites.
+    ///
+    /// `None` for entries unpacked directly through [`Entry::unpack_in`]
+    /// outside of an [`Archive::unpack`](crate::Archive::unpack) transaction;
+    /// such calls preserve their historical single-entry behavior.
+    pub transaction: Option<Rc<RefCell<ExtractionTransaction>>>,
 }
 
 pub enum EntryIo<'a> {
@@ -209,8 +219,15 @@ impl<'a, R: Read> Entry<'a, R> {
     /// This function will write the entire contents of this file into the
     /// location obtained by appending the path of this file in the archive to
     /// `dst`, creating any intermediate directories if needed. Metadata will
-    /// also be propagated to the path `dst`. Any existing file at the location
-    /// `dst` will be overwritten.
+    /// also be propagated to the path `dst`. An existing file at the location
+    /// `dst` is overwritten according to the archive's overwrite setting.
+    ///
+    /// When entries are extracted as part of an
+    /// [`Archive::unpack`](crate::Archive::unpack) transaction, an entry whose
+    /// normalized path identity was already claimed by an earlier entry in the
+    /// same archive is rejected instead of overwriting it, even with
+    /// overwriting enabled. Iterating entries and calling this method directly
+    /// does not run that cross-entry check.
     ///
     /// # Security
     ///
@@ -245,6 +262,16 @@ impl<'a, R: Read> Entry<'a, R> {
     /// The mask is 0 by default and is currently only implemented on Unix.
     pub fn set_mask(&mut self, mask: u32) {
         self.fields.mask = mask;
+    }
+
+    /// Attach the per-extraction transaction used to reject normalized
+    /// path-identity conflicts.
+    ///
+    /// This is an internal hook used by [`Archive::unpack`](crate::Archive::unpack);
+    /// entries iterated directly and extracted with [`Entry::unpack_in`] keep
+    /// their historical single-entry behavior.
+    pub(crate) fn set_transaction(&mut self, transaction: Rc<RefCell<ExtractionTransaction>>) {
+        self.fields.transaction = Some(transaction);
     }
 
     /// Indicate whether extended file attributes (xattrs on Unix) are preserved
@@ -394,28 +421,26 @@ impl<'a> EntryFields<'a> {
         // library, but we specially handle a few cases here as well.
 
         let mut file_dst = dst.to_path_buf();
-        {
-            let path = self.path().map_err(|e| {
-                TarError::new(
-                    format!("invalid path in entry header: {}", self.path_lossy()),
-                    e,
-                )
-            })?;
-            for part in path.components() {
-                match part {
-                    // Leading '/' characters, root paths, and '.'
-                    // components are just ignored and treated as "empty
-                    // components"
-                    Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
+        let path = self.path().map_err(|e| {
+            TarError::new(
+                format!("invalid path in entry header: {}", self.path_lossy()),
+                e,
+            )
+        })?;
+        for part in path.components() {
+            match part {
+                // Leading '/' characters, root paths, and '.'
+                // components are just ignored and treated as "empty
+                // components"
+                Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
 
-                    // If any part of the filename is '..', then skip over
-                    // unpacking the file to prevent directory traversal
-                    // security issues.  See, e.g.: CVE-2001-1267,
-                    // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
-                    Component::ParentDir => return Ok(false),
+                // If any part of the filename is '..', then skip over
+                // unpacking the file to prevent directory traversal
+                // security issues.  See, e.g.: CVE-2001-1267,
+                // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
+                Component::ParentDir => return Ok(false),
 
-                    Component::Normal(part) => file_dst.push(part),
-                }
+                Component::Normal(part) => file_dst.push(part),
             }
         }
 
@@ -431,6 +456,37 @@ impl<'a> EntryFields<'a> {
             None => return Ok(false),
         };
 
+        // When this entry is part of an `Archive::unpack` transaction, claim
+        // its normalized path identity *before* touching the filesystem. Two
+        // archive entries whose raw paths differ only by dot/separator
+        // variants resolve to the same `file_dst`; rejecting the second claim
+        // prevents a later entry from silently overwriting the file committed
+        // by the first one even when `overwrite` is enabled. Genuinely
+        // different paths are distinct identities and remain allowed.
+        // Directory entries never claim a path identity. Real-world archives
+        // legitimately contain repeated directory headers (see the
+        // `duplicate_dirs.tar` fixture), and creating an existing directory is
+        // an idempotent, non-destructive operation. Empty directories must
+        // therefore keep working; only entries that materialize a node at the
+        // path (files, symlinks, hard links, ...) participate in conflict
+        // detection so that a committed file cannot be replaced.
+        if let Some(transaction) = &self.transaction {
+            if !self.materializes_as_directory() {
+                let raw_path = self.path_lossy();
+                if let Err(err) = transaction.borrow_mut().claim(&path, &raw_path) {
+                    return Err(TarError::new(
+                        format!(
+                            "refusing to extract entry with path `{}`: its normalized \
+                         path identity was already claimed earlier in this extraction",
+                            raw_path
+                        ),
+                        err,
+                    )
+                    .into());
+                }
+            }
+        }
+
         self.ensure_dir_created(dst, parent)
             .map_err(|e| TarError::new(format!("failed to create `{}`", parent.display()), e))?;
 
@@ -440,6 +496,22 @@ impl<'a> EntryFields<'a> {
             .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
 
         Ok(true)
+    }
+
+    /// Whether this entry is materialized as a directory when unpacked.
+    ///
+    /// This must stay in sync with the directory handling inside
+    /// [`EntryFields::unpack`]: an entry is created as a directory either when
+    /// its entry type is [`crate::EntryType::Directory`], or, for old
+    /// (non-ustar) headers, when its path ends in `/` (old BSD-tar
+    /// compatibility). Such entries create directories idempotently and never
+    /// replace another node, so they do not claim a normalized path identity
+    /// in the extraction transaction. Checking only
+    /// [`crate::EntryType::is_dir`] would miss the trailing-slash form and
+    /// wrongly reject legitimate archives that repeat such directory headers.
+    fn materializes_as_directory(&self) -> bool {
+        self.header.entry_type().is_dir()
+            || (self.header.as_ustar().is_none() && self.path_bytes().ends_with(b"/"))
     }
 
     /// Unpack as destination directory `dst`.
