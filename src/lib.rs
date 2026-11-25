@@ -14,6 +14,11 @@
 //! directory: paths containing `..` are rejected, and symlink targets within
 //! the archive are validated before use.
 //!
+//! Hard links are additionally restricted to object identities that have
+//! already been committed by secure extraction. A plain-text security record
+//! named `.tar-security-record` is written to the extraction root with commit
+//! and hard-link verdict details for later review.
+//!
 //! **Concurrent mutation of the destination tree is outside the threat model.**
 //! If another process modifies the destination (for example, by atomically
 //! swapping a symlink) while extraction is in progress, this crate may follow
@@ -58,6 +63,7 @@ mod entry_type;
 mod error;
 mod header;
 mod pax;
+mod security_record;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)

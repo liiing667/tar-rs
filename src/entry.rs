@@ -6,6 +6,7 @@ use std::io::prelude::*;
 use std::io::{self, Error, ErrorKind, SeekFrom};
 use std::marker;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use filetime::{self, FileTime};
 
@@ -13,6 +14,7 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::security_record::{self, CommitRegistry, HardlinkAudit, SECURITY_RECORD_FILE_NAME};
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -42,11 +44,20 @@ pub struct EntryFields<'a> {
     pub preserve_ownerships: bool,
     pub preserve_mtime: bool,
     pub overwrite: bool,
+    pub committed: Arc<CommitRegistry>,
 }
 
 pub enum EntryIo<'a> {
     Pad(io::Take<io::Repeat>),
     Data(io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+}
+
+/// Resolved hard-link target that is allowed to be linked by `unpack_in`.
+struct AuthorizedHardlink {
+    link_name: PathBuf,
+    requested_target: PathBuf,
+    canonical_target: PathBuf,
+    metadata: fs::Metadata,
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom
@@ -425,21 +436,188 @@ impl<'a> EntryFields<'a> {
             return Ok(true);
         }
 
+        // The audit record is owned by the extractor. Never allow an archive
+        // member with the reserved root-level name to replace or spoof it.
+        if file_dst
+            .strip_prefix(dst)
+            .map(|relative| relative == Path::new(SECURITY_RECORD_FILE_NAME))
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
         // Skip entries without a parent (i.e. outside of FS root)
         let parent = match file_dst.parent() {
             Some(p) => p,
             None => return Ok(false),
         };
 
+        // `unpack_in` creates missing intermediate extraction directories,
+        // including the destination root itself.
+        fs::create_dir_all(dst)
+            .map_err(|e| TarError::new(format!("failed to create `{}`", dst.display()), e))?;
+
         self.ensure_dir_created(dst, parent)
             .map_err(|e| TarError::new(format!("failed to create `{}`", parent.display()), e))?;
 
-        let canon_target = self.validate_inside_dst(dst, parent)?;
+        let (canon_target, canon_parent) = self.validate_inside_dst(dst, parent)?;
+        let file_name = match file_dst.file_name() {
+            Some(name) => name,
+            None => return Ok(false),
+        };
+        let final_dst = canon_parent.join(file_name);
+        let kind = self.header.entry_type();
+        let hardlink_target = if kind.is_hard_link() {
+            Some(self.authorize_committed_hardlink(&canon_target, &final_dst)?)
+        } else {
+            None
+        };
 
-        self.unpack(Some(&canon_target), &file_dst)
-            .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
+        let unpacked = self
+            .unpack(Some(&canon_target), &final_dst)
+            .map_err(|e| TarError::new(format!("failed to unpack `{}`", final_dst.display()), e))?;
+
+        let entry_path = self.path()?;
+        match unpacked {
+            Unpacked::File(file) => {
+                let metadata = file.metadata()?;
+                #[cfg(unix)]
+                self.committed.mark_committed_file(&metadata);
+                #[cfg(not(unix))]
+                self.committed.mark_committed_path(&final_dst);
+                security_record::record_commit(
+                    &canon_target,
+                    self.header_pos,
+                    &entry_path,
+                    &final_dst,
+                    "file",
+                    Some(&metadata),
+                )?;
+            }
+            Unpacked::__Nonexhaustive => {
+                if kind.is_hard_link() {
+                    if let Some(hardlink) = hardlink_target {
+                        let audit = HardlinkAudit {
+                            header_offset: self.header_pos,
+                            entry: &entry_path,
+                            link_name: &hardlink.link_name,
+                            requested_target: &hardlink.requested_target,
+                            canonical_target: Some(&hardlink.canonical_target),
+                            destination: &final_dst,
+                            metadata: Some(&hardlink.metadata),
+                        };
+                        security_record::record_hardlink_verdict(
+                            &canon_target,
+                            &audit,
+                            true,
+                            None,
+                        )?;
+                        security_record::record_commit(
+                            &canon_target,
+                            self.header_pos,
+                            &entry_path,
+                            &final_dst,
+                            "hardlink",
+                            Some(&hardlink.metadata),
+                        )?;
+                    }
+                }
+            }
+        }
 
         Ok(true)
+    }
+
+    /// Validate that a hard-link target resolves inside `root` and identifies
+    /// an object already committed by secure extraction.
+    fn authorize_committed_hardlink(
+        &self,
+        root: &Path,
+        destination: &Path,
+    ) -> io::Result<AuthorizedHardlink> {
+        let entry_path = self.path()?;
+        let link_name = self.link_name()?.ok_or_else(|| {
+            other(&format!(
+                "hard link listed for {} but no link name found",
+                String::from_utf8_lossy(self.header.as_bytes())
+            ))
+        })?;
+        let requested_target = root.join(&link_name);
+
+        let canonical_target = match self.validate_inside_dst(root, &requested_target) {
+            Ok((_root, canonical_target)) => canonical_target,
+            Err(error) => {
+                let audit = HardlinkAudit {
+                    header_offset: self.header_pos,
+                    entry: &entry_path,
+                    link_name: &link_name,
+                    requested_target: &requested_target,
+                    canonical_target: None,
+                    destination,
+                    metadata: None,
+                };
+                security_record::record_hardlink_verdict(
+                    root,
+                    &audit,
+                    false,
+                    Some("outside_or_missing_target"),
+                )?;
+                return Err(error);
+            }
+        };
+
+        let metadata = fs::metadata(&canonical_target).map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!(
+                    "{} while reading hard-link target metadata {}",
+                    error,
+                    canonical_target.display()
+                ),
+            )
+        })?;
+
+        #[cfg(unix)]
+        let committed = self.committed.is_committed(&metadata);
+        #[cfg(not(unix))]
+        let committed = self.committed.is_committed(&canonical_target);
+
+        if !committed {
+            let audit = HardlinkAudit {
+                header_offset: self.header_pos,
+                entry: &entry_path,
+                link_name: &link_name,
+                requested_target: &requested_target,
+                canonical_target: Some(&canonical_target),
+                destination,
+                metadata: Some(&metadata),
+            };
+            security_record::record_hardlink_verdict(
+                root,
+                &audit,
+                false,
+                Some("target_not_committed"),
+            )?;
+            return Err(TarError::new(
+                format!(
+                    "refusing hard link `{}` to uncommitted target `{}`",
+                    entry_path.display(),
+                    canonical_target.display()
+                ),
+                Error::new(
+                    ErrorKind::Other,
+                    "hard-link target was not extracted by this archive",
+                ),
+            )
+            .into());
+        }
+
+        Ok(AuthorizedHardlink {
+            link_name: link_name.into_owned(),
+            requested_target,
+            canonical_target,
+            metadata,
+        })
     }
 
     /// Unpack as destination directory `dst`.
@@ -927,7 +1105,7 @@ impl<'a> EntryFields<'a> {
         Ok(())
     }
 
-    fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
+    fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<(PathBuf, PathBuf)> {
         // Abort if target (canonical) parent is outside of `dst`
         let canon_parent = file_dst.canonicalize().map_err(|err| {
             Error::new(
@@ -952,7 +1130,7 @@ impl<'a> EntryFields<'a> {
             );
             return Err(err.into());
         }
-        Ok(canon_target)
+        Ok((canon_target, canon_parent))
     }
 }
 

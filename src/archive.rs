@@ -6,12 +6,14 @@ use std::io::prelude::*;
 use std::io::{self, SeekFrom};
 use std::marker;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
 use crate::header::BLOCK_SIZE;
 use crate::other;
 use crate::pax::*;
+use crate::security_record::CommitRegistry;
 use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
 
 /// A top-level representation of an archive file.
@@ -30,6 +32,7 @@ pub struct ArchiveInner<R: ?Sized> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
+    committed: Arc<CommitRegistry>,
     obj: RefCell<R>,
 }
 
@@ -62,6 +65,7 @@ impl<R: Read> Archive<R> {
                 preserve_mtime: true,
                 overwrite: true,
                 ignore_zeros: false,
+                committed: CommitRegistry::new_shared(),
                 obj: RefCell::new(obj),
                 pos: Cell::new(0),
             },
@@ -368,6 +372,7 @@ impl<'a> EntriesFields<'a> {
             preserve_mtime: self.archive.inner.preserve_mtime,
             overwrite: self.archive.inner.overwrite,
             preserve_ownerships: self.archive.inner.preserve_ownerships,
+            committed: self.archive.inner.committed.clone(),
         };
 
         // Store where the next entry is, rounding up by 512 bytes (the size of
