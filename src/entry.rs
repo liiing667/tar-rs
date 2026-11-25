@@ -13,6 +13,11 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::path::{
+    header_linkname_field_saturated, header_name_field_saturated, interpret_name, InterpretedName,
+    NameKind,
+};
+use crate::security_log::{record_event, SecurityEvent};
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -84,6 +89,15 @@ impl<'a, R: Read> Entry<'a, R> {
     /// separators, and it will not always return the same value as
     /// `self.header().path_bytes()` as some archive formats have support for
     /// longer path names described in separate entries.
+    ///
+    /// # Security
+    ///
+    /// This accessor is infallible for backwards compatibility. If an entry's
+    /// PAX and USTAR names disagree in a way that is not a valid long-name
+    /// truncation, [`Entry::path`] returns an error while this method falls
+    /// back to the USTAR header spelling. When validating untrusted archives,
+    /// rely on [`Entry::path`] (and extraction, which rejects such entries)
+    /// rather than on this byte accessor.
     pub fn path_bytes(&self) -> Cow<'_, [u8]> {
         self.fields.path_bytes()
     }
@@ -110,6 +124,14 @@ impl<'a, R: Read> Entry<'a, R> {
     /// Note that this will not always return the same value as
     /// `self.header().link_name_bytes()` as some archive formats have support for
     /// longer path names described in separate entries.
+    ///
+    /// # Security
+    ///
+    /// This accessor is infallible for backwards compatibility. If an entry's
+    /// PAX `linkpath` and USTAR link name disagree, [`Entry::link_name`]
+    /// returns an error while this method falls back to the USTAR header
+    /// spelling. When validating untrusted archives, rely on
+    /// [`Entry::link_name`] rather than on this byte accessor.
     pub fn link_name_bytes(&self) -> Option<Cow<'_, [u8]>> {
         self.fields.link_name_bytes()
     }
@@ -302,30 +324,74 @@ impl<'a> EntryFields<'a> {
     }
 
     fn path(&self) -> io::Result<Cow<'_, Path>> {
-        bytes2path(self.path_bytes())
+        // Go through the validated interpretation rather than the infallible
+        // byte accessor so that validators using `Entry::path` observe the
+        // exact same rejection that extraction enforces.
+        let interpreted = self.interpreted_path()?;
+        bytes2path(interpreted.bytes)
+    }
+
+    /// Interpret this entry's own path name through the single shared
+    /// resolution routine used by both the public accessors and extraction.
+    ///
+    /// Returns both the authoritative bytes and, when a PAX extension overrode
+    /// the USTAR header, a validated description of that override.
+    fn interpreted_path(&self) -> io::Result<InterpretedName<'_>> {
+        interpret_name(
+            self.long_pathname.as_deref(),
+            self.pax_extensions.as_deref(),
+            self.header.path_bytes(),
+            header_name_field_saturated(&self.header),
+            NameKind::Path,
+        )
+    }
+
+    /// Interpret this entry's link name through the same shared routine.
+    fn interpreted_link_name(&self) -> io::Result<Option<InterpretedName<'_>>> {
+        // A GNU long-link record or a PAX `linkpath` keyword is what gives an
+        // entry a link name. A regular file may carry unrelated PAX extensions
+        // (e.g. `size`) while having an empty linkname field; in that case there
+        // is no link name to interpret and we must stay `None`.
+        let has_pax_linkpath = self
+            .pax_extensions
+            .as_deref()
+            .map(|pax| {
+                PaxExtensions::new(pax)
+                    .filter_map(|record| record.ok())
+                    .any(|record| record.key_bytes() == b"linkpath")
+            })
+            .unwrap_or(false);
+        if self.long_linkname.is_none() && !has_pax_linkpath {
+            // Defer to the header field, which is `None` for an empty linkname.
+            return Ok(self.header.link_name_bytes().map(|name| InterpretedName {
+                bytes: name,
+                record: None,
+            }));
+        }
+        let header_name = self
+            .header
+            .link_name_bytes()
+            .unwrap_or_else(|| Cow::Borrowed(&[][..]));
+        Ok(Some(interpret_name(
+            self.long_linkname.as_deref(),
+            self.pax_extensions.as_deref(),
+            header_name,
+            header_linkname_field_saturated(&self.header),
+            NameKind::Link,
+        )?))
     }
 
     fn path_bytes(&self) -> Cow<'_, [u8]> {
-        match self.long_pathname {
-            Some(ref bytes) => {
-                if let Some(&0) = bytes.last() {
-                    Cow::Borrowed(&bytes[..bytes.len() - 1])
-                } else {
-                    Cow::Borrowed(bytes)
-                }
-            }
-            None => {
-                if let Some(ref pax) = self.pax_extensions {
-                    let pax = PaxExtensions::new(pax)
-                        .filter_map(|f| f.ok())
-                        .find(|f| f.key_bytes() == b"path")
-                        .map(|f| f.value_bytes());
-                    if let Some(field) = pax {
-                        return Cow::Borrowed(field);
-                    }
-                }
-                self.header.path_bytes()
-            }
+        // The public accessor must never disagree with extraction about the
+        // name of an entry. A name conflict that cannot be explained by a
+        // legitimate long name therefore surfaces as an error here too. To
+        // preserve the infallible signature of this long-standing API, such an
+        // entry falls back to the USTAR header spelling rather than
+        // panicking; the authoritative rejection happens through `path()` and
+        // during `unpack_in`.
+        match self.interpreted_path() {
+            Ok(interpreted) => interpreted.bytes,
+            Err(_) => self.header.path_bytes(),
         }
     }
 
@@ -335,33 +401,20 @@ impl<'a> EntryFields<'a> {
     }
 
     fn link_name(&self) -> io::Result<Option<Cow<'_, Path>>> {
-        match self.link_name_bytes() {
-            Some(bytes) => bytes2path(bytes).map(Some),
+        // Use the validated interpretation so link-name conflicts are rejected
+        // consistently instead of being hidden behind the byte accessor.
+        match self.interpreted_link_name()? {
+            Some(interpreted) => bytes2path(interpreted.bytes).map(Some),
             None => Ok(None),
         }
     }
 
     fn link_name_bytes(&self) -> Option<Cow<'_, [u8]>> {
-        match self.long_linkname {
-            Some(ref bytes) => {
-                if let Some(&0) = bytes.last() {
-                    Some(Cow::Borrowed(&bytes[..bytes.len() - 1]))
-                } else {
-                    Some(Cow::Borrowed(bytes))
-                }
-            }
-            None => {
-                if let Some(ref pax) = self.pax_extensions {
-                    let pax = PaxExtensions::new(pax)
-                        .filter_map(|f| f.ok())
-                        .find(|f| f.key_bytes() == b"linkpath")
-                        .map(|f| f.value_bytes());
-                    if let Some(field) = pax {
-                        return Some(Cow::Borrowed(field));
-                    }
-                }
-                self.header.link_name_bytes()
-            }
+        // See `path_bytes` for the rationale of the shared resolution.
+        match self.interpreted_link_name() {
+            Ok(Some(interpreted)) => Some(interpreted.bytes),
+            Ok(None) => None,
+            Err(_) => self.header.link_name_bytes(),
         }
     }
 
@@ -395,12 +448,23 @@ impl<'a> EntryFields<'a> {
 
         let mut file_dst = dst.to_path_buf();
         {
-            let path = self.path().map_err(|e| {
+            // Resolve the name through the exact same routine as the public
+            // `Entry::path` accessor. A PAX/USTAR disagreement that is not a
+            // legitimate long-name truncation is rejected here, so a consumer
+            // can never write to a different path than a validator observed.
+            let interpreted = self.interpreted_path().map_err(|e| {
                 TarError::new(
                     format!("invalid path in entry header: {}", self.path_lossy()),
                     e,
                 )
             })?;
+            let path = bytes2path(interpreted.bytes).map_err(|e| {
+                TarError::new(
+                    format!("invalid path in entry header: {}", self.path_lossy()),
+                    e,
+                )
+            })?;
+            let mut saw_parent = false;
             for part in path.components() {
                 match part {
                     // Leading '/' characters, root paths, and '.'
@@ -412,10 +476,34 @@ impl<'a> EntryFields<'a> {
                     // unpacking the file to prevent directory traversal
                     // security issues.  See, e.g.: CVE-2001-1267,
                     // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
-                    Component::ParentDir => return Ok(false),
+                    Component::ParentDir => {
+                        saw_parent = true;
+                    }
 
-                    Component::Normal(part) => file_dst.push(part),
+                    Component::Normal(part) => {
+                        if !saw_parent {
+                            file_dst.push(part)
+                        }
+                    }
                 }
+            }
+            // Only audit an override once we know the entry is actually going
+            // to be extracted; recording a traversal entry as "accepted"
+            // before it is skipped would be misleading.
+            if !saw_parent {
+                if let Some(conflict) = interpreted.record.as_ref() {
+                    record_event(
+                        dst,
+                        &SecurityEvent {
+                            header_pos: Some(self.header_pos),
+                            conflict,
+                        },
+                    )
+                    .map_err(|e| TarError::new("failed to write extraction security record", e))?;
+                }
+            }
+            if saw_parent {
+                return Ok(false);
             }
         }
 
@@ -508,6 +596,23 @@ impl<'a> EntryFields<'a> {
             )?;
             return Ok(Unpacked::__Nonexhaustive);
         } else if kind.is_hard_link() || kind.is_symlink() {
+            // Validate the link name through the shared interpreter so a PAX
+            // `linkpath` that disagrees with the USTAR linkname is rejected
+            // before any link is created. Record accepted overrides when
+            // extracting inside a destination root.
+            let interpreted_link = self.interpreted_link_name()?;
+            if let (Some(root), Some(interpreted)) = (target_base, interpreted_link.as_ref()) {
+                if let Some(conflict) = interpreted.record.as_ref() {
+                    record_event(
+                        root,
+                        &SecurityEvent {
+                            header_pos: Some(self.header_pos),
+                            conflict,
+                        },
+                    )
+                    .map_err(|e| TarError::new("failed to write extraction security record", e))?;
+                }
+            }
             let src = match self.link_name()? {
                 Some(name) => name,
                 None => {

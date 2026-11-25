@@ -14,6 +14,27 @@
 //! directory: paths containing `..` are rejected, and symlink targets within
 //! the archive are validated before use.
 //!
+//! ### Single, validated name interpretation
+//!
+//! An entry may carry its name in more than one place: the USTAR header
+//! fields, a GNU long-name record, or a PAX `path`/`linkpath` extension. The
+//! public [`Entry::path`]/[`Entry::link_name`] accessors and the extraction
+//! code resolve these through one shared routine, so a validator inspecting an
+//! entry and the code writing it to disk always observe the same path. When a
+//! PAX name differs from the USTAR header name, the only accepted discrepancy
+//! is the standard long-name case where the 100-byte USTAR name field is
+//! completely filled with a truncated prefix of the longer PAX name. A short
+//! header name that merely happens to be a prefix, and any other disagreement,
+//! is rejected with an error rather than resolved in favor of one spelling.
+//!
+//! Every accepted PAX/USTAR name override is appended to a plain-text
+//! security manifest named `.tar-security-record` at the root of the
+//! extraction destination. Each line records the entry's header offset, both
+//! byte spellings and whether the override was an accepted truncation,
+//! providing a reviewable audit trail inside the extracted tree. The manifest
+//! is opened without following symlinks, so an archive that plants a symlink at
+//! that path cannot redirect the audit trail outside the destination.
+//!
 //! **Concurrent mutation of the destination tree is outside the threat model.**
 //! If another process modifies the destination (for example, by atomically
 //! swapping a symlink) while extraction is in progress, this crate may follow
@@ -57,7 +78,9 @@ mod entry;
 mod entry_type;
 mod error;
 mod header;
+mod path;
 mod pax;
+mod security_log;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)
