@@ -228,6 +228,8 @@ impl Archive<dyn Read + '_> {
         // unpacked paths over 260 characters will fail on creation with a
         // NotFound exception.
         let dst = &dst.canonicalize().unwrap_or(dst.to_path_buf());
+        crate::security_log::record_notice(dst, "archive-unpack-started")
+            .map_err(|e| TarError::new("failed to write extraction security record", e))?;
 
         // Delay any directory entries until the end (they will be created if needed by
         // descendants), to ensure that directory permissions do not interfere with descendant
@@ -253,6 +255,8 @@ impl Archive<dyn Read + '_> {
         for mut dir in directories {
             dir.unpack_in(dst)?;
         }
+        crate::security_log::record_notice(dst, "archive-unpack-complete")
+            .map_err(|e| TarError::new("failed to write extraction security record", e))?;
 
         Ok(())
     }

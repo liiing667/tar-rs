@@ -13,6 +13,7 @@ use crate::archive::ArchiveInner;
 use crate::error::TarError;
 use crate::header::bytes2path;
 use crate::other;
+use crate::security_log::{self, SecurityRecord};
 use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
@@ -201,7 +202,38 @@ impl<'a, R: Read> Entry<'a, R> {
     /// }
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
-        self.fields.unpack(None, dst.as_ref())
+        let dst = dst.as_ref();
+        let result = self.fields.unpack(None, dst);
+        let root = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+
+        match &result {
+            Ok(unpacked) => {
+                let identity = match unpacked {
+                    Unpacked::File(file) => file_identity(file).or_else(|| path_identity(dst)),
+                    Unpacked::__Nonexhaustive => path_identity(dst),
+                };
+                // `Entry::unpack` is explicitly rootless. Audit persistence is
+                // best-effort there; unlike `unpack_in`, it has no designated
+                // extraction root whose writability is part of the contract.
+                let _ = self.fields.record_security_audit(
+                    root,
+                    dst,
+                    "committed-current-entry-identity",
+                    identity,
+                );
+            }
+            Err(err) => {
+                let verdict = format!("security-blocked-or-failed: {err}");
+                let _ = self
+                    .fields
+                    .record_security_audit(root, dst, &verdict, path_identity(dst));
+            }
+        }
+
+        result
     }
 
     /// Extracts this file under the specified path, avoiding security issues.
@@ -412,7 +444,15 @@ impl<'a> EntryFields<'a> {
                     // unpacking the file to prevent directory traversal
                     // security issues.  See, e.g.: CVE-2001-1267,
                     // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
-                    Component::ParentDir => return Ok(false),
+                    Component::ParentDir => {
+                        let _ = self.record_security_audit(
+                            dst,
+                            &file_dst,
+                            "skipped-parent-directory-reference",
+                            path_identity(&file_dst),
+                        );
+                        return Ok(false);
+                    }
 
                     Component::Normal(part) => file_dst.push(part),
                 }
@@ -422,6 +462,12 @@ impl<'a> EntryFields<'a> {
         // Skip cases where only slashes or '.' parts were seen, because
         // this is effectively an empty filename.
         if *dst == *file_dst {
+            let _ = self.record_security_audit(
+                dst,
+                dst,
+                "skipped-empty-entry-name status=empty-metadata",
+                path_identity(dst),
+            );
             return Ok(true);
         }
 
@@ -431,15 +477,114 @@ impl<'a> EntryFields<'a> {
             None => return Ok(false),
         };
 
-        self.ensure_dir_created(dst, parent)
-            .map_err(|e| TarError::new(format!("failed to create `{}`", parent.display()), e))?;
+        if let Err(err) = self.ensure_dir_created(dst, parent) {
+            let tar_error = TarError::new(format!("failed to create `{}`", parent.display()), err);
+            let verdict = format!("security-blocked-or-failed: {tar_error}");
+            let _ = self.record_security_audit(dst, &file_dst, &verdict, path_identity(&file_dst));
+            return Err(tar_error.into());
+        }
 
-        let canon_target = self.validate_inside_dst(dst, parent)?;
+        let canon_target = match self.validate_inside_dst(dst, parent) {
+            Ok(root) => root,
+            Err(err) => {
+                let verdict = format!("security-blocked-or-failed: {err}");
+                let _ =
+                    self.record_security_audit(dst, &file_dst, &verdict, path_identity(&file_dst));
+                return Err(err);
+            }
+        };
 
-        self.unpack(Some(&canon_target), &file_dst)
-            .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
+        let unpacked = match self.unpack(Some(&canon_target), &file_dst) {
+            Ok(unpacked) => unpacked,
+            Err(err) => {
+                let verdict = format!("security-blocked-or-failed: {err}");
+                let _ = self.record_security_audit(
+                    &canon_target,
+                    &file_dst,
+                    &verdict,
+                    path_identity(&file_dst),
+                );
+                return Err(TarError::new(
+                    format!("failed to unpack `{}`", file_dst.display()),
+                    err,
+                )
+                .into());
+            }
+        };
+
+        let identity = match &unpacked {
+            Unpacked::File(file) => file_identity(file).or_else(|| path_identity(&file_dst)),
+            Unpacked::__Nonexhaustive => path_identity(&file_dst),
+        };
+
+        self.record_security_audit(
+            &canon_target,
+            &file_dst,
+            "committed-current-entry-identity",
+            identity,
+        )
+        .map_err(|e| TarError::new("failed to write extraction security record", e))?;
 
         Ok(true)
+    }
+
+    fn record_security_audit(
+        &self,
+        root: &Path,
+        destination: &Path,
+        verdict: &str,
+        identity: Option<String>,
+    ) -> io::Result<()> {
+        let entry = self.path_lossy();
+        let mode = self
+            .header
+            .mode()
+            .map(|mode| format!("mode={:o}", mode))
+            .unwrap_or_else(|_| "mode=invalid".to_owned());
+        let mtime = self
+            .header
+            .mtime()
+            .map(|mtime| format!("mtime={}", mtime))
+            .unwrap_or_else(|_| "mtime=invalid".to_owned());
+
+        let xattr_keys = self
+            .pax_extensions
+            .as_deref()
+            .map(|raw| {
+                PaxExtensions::new(raw)
+                    .filter_map(|extension| extension.ok())
+                    .filter_map(|extension| {
+                        let prefix = crate::pax::PAX_SCHILYXATTR.as_bytes();
+                        extension
+                            .key_bytes()
+                            .strip_prefix(prefix)
+                            .map(|key| String::from_utf8_lossy(key).into_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+
+        let metadata = format!(
+            "{mode} {mtime} preserve_mtime={} preserve_permissions={} \
+             preserve_ownerships={} unpack_xattrs={} xattr_keys=[{xattr_keys}]",
+            self.preserve_mtime,
+            self.preserve_permissions,
+            self.preserve_ownerships,
+            self.unpack_xattrs,
+        );
+
+        security_log::append(
+            root,
+            &SecurityRecord {
+                header_pos: self.header_pos,
+                entry: &entry,
+                destination,
+                identity,
+                metadata,
+                verdict,
+            },
+        )
     }
 
     /// Unpack as destination directory `dst`.
@@ -712,8 +857,14 @@ impl<'a> EntryFields<'a> {
             self.preserve_ownerships,
         )?;
         if self.unpack_xattrs {
-            set_xattrs(self, dst)?;
+            set_xattrs(self, &f).map_err(|e| {
+                TarError::new(
+                    format!("failed to set extended attributes for `{}`", dst.display()),
+                    e,
+                )
+            })?;
         }
+
         return Ok(Unpacked::File(f));
 
         fn set_ownerships(
@@ -864,9 +1015,10 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(all(unix, not(target_arch = "wasm32"), feature = "xattr"))]
-        fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
+        fn set_xattrs(me: &mut EntryFields, file: &std::fs::File) -> io::Result<()> {
             use std::ffi::OsStr;
             use std::os::unix::prelude::*;
+            use xattr::FileExt as _;
 
             let exts = match me.pax_extensions() {
                 Ok(Some(e)) => e,
@@ -882,18 +1034,15 @@ impl<'a> EntryFields<'a> {
                 .map(|(key, e)| (OsStr::from_bytes(key), e.value_bytes()));
 
             for (key, value) in exts {
-                xattr::set(dst, key, value).map_err(|e| {
-                    TarError::new(
-                        format!(
-                            "failed to set extended \
-                             attributes to {}. \
-                             Xattrs: key={:?}, value={:?}.",
-                            dst.display(),
-                            key,
-                            String::from_utf8_lossy(value)
-                        ),
-                        e,
-                    )
+                // Set through the open file descriptor for the object that was
+                // actually created and committed for this entry. A path-based
+                // call could be redirected at another hard link or swapped
+                // filesystem object.
+                file.set_xattr(key, value).map_err(|e| {
+                    other(&format!(
+                        "failed to set extended attribute {:?} on committed entry: {e}",
+                        key
+                    ))
                 })?;
             }
 
@@ -902,7 +1051,7 @@ impl<'a> EntryFields<'a> {
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
         #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+        fn set_xattrs(_: &mut EntryFields, _: &std::fs::File) -> io::Result<()> {
             Ok(())
         }
     }
@@ -953,6 +1102,45 @@ impl<'a> EntryFields<'a> {
             return Err(err.into());
         }
         Ok(canon_target)
+    }
+}
+
+fn path_identity(path: &Path) -> Option<String> {
+    let metadata = path.symlink_metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!(
+            "dev={} ino={} mode={:o}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn file_identity(file: &std::fs::File) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().ok().map(|metadata| {
+            format!(
+                "dev={} ino={} mode={:o}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode()
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
     }
 }
 

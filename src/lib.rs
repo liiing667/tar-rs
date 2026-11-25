@@ -23,6 +23,11 @@
 //! where the destination may be concurrently modified, use the [`cap-std`]
 //! crate and/or OS-level sandboxing.
 //!
+//! Extractions through [`Archive::unpack`] or [`Entry::unpack_in`] also append
+//! an audit trail to `.tar-security-record` at the extraction root. The record
+//! identifies the archive offset, member name, committed filesystem identity,
+//! requested metadata and whether that identity was accepted or blocked.
+//!
 //! [`cap-std`]: https://docs.rs/cap-std/
 
 // More docs about the detailed tar format can also be found here:
@@ -58,6 +63,7 @@ mod entry_type;
 mod error;
 mod header;
 mod pax;
+mod security_log;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)
